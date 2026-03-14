@@ -181,10 +181,26 @@ jobs:
           CSI_DRIVER_IRSA_ROLE_ARN: "arn:aws:iam::${{ steps.aws-creds.outputs.aws-account-id }}:role/s3-csi-${{ inputs.environment }}-driver-irsa"
         run: tests/e2e-kubernetes/scripts/run.sh
       - name: Run E2E Tests
+        id: run_e2e
         env:
           ACTION: "run_tests"
           IMDS_AVAILABLE: "false"
         run: tests/e2e-kubernetes/scripts/run.sh
+      - name: Generate test summary
+        if: always()
+        run: |
+          python3 tests/e2e-kubernetes/scripts/generate_test_summary.py \
+            tests/e2e-kubernetes/test-report.json >> $GITHUB_STEP_SUMMARY
+      - name: Upload test report
+        if: ${{ always() && steps.run_e2e.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-rosa
+          path: |
+            tests/e2e-kubernetes/test-report.json
+            tests/e2e-kubernetes/junit-report.xml
+          retention-days: 14
+          if-no-files-found: ignore
       - name: Post e2e cleanup
         if: always()
         env:
