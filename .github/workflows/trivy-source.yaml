@@ -18,16 +18,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Run Trivy vulnerability scanner in repo mode
-        uses: aquasecurity/trivy-action@0.35.0
+      - name: Install Trivy
+        run: make install-trivy
+
+      - name: Run Trivy source scan
         env:
           TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db
-        with:
-          scan-type: 'fs'
-          ignore-unfixed: true
-          format: 'sarif'
-          output: 'results.sarif'
-          severity: 'HIGH,CRITICAL'
+        run: |
+          ./tools/bin/trivy fs \
+            --ignore-unfixed \
+            --format sarif \
+            --output results.sarif \
+            --severity HIGH,CRITICAL \
+            .
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
