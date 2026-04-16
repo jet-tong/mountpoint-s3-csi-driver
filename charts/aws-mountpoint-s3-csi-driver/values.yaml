@@ -129,6 +129,12 @@ eksPodIdentityAgent:
 # TODO: Remove this in v3 as systemd mount support will be discontinued
 supportLegacySystemDMounts: true
 
+# Driver mode: "pod" (default, V2 Mountpoint Pod architecture) or
+# "daemonset" (two-daemonset architecture, eliminates scheduling issues).
+# In daemonset mode, the controller and Mountpoint Pods are not deployed.
+# Instead, a mounter DaemonSet runs on every node and manages mount-s3 processes.
+mode: "pod"
+
 experimental:
   # Enables support for `s3.csi.aws.com/reserve-headroom-for-mppod` scheduling gate on the Workload Pods.
   # See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/HEADROOM_FOR_MPPOD.md for more details.

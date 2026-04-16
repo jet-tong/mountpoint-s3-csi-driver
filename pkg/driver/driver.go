@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -50,6 +51,7 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/version"
 	mpmounter "github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/podmounter/mppod/watcher"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 const (
@@ -62,8 +64,16 @@ const (
 
 var (
 	mountpointPodNamespace = os.Getenv("MOUNTPOINT_NAMESPACE")
+	driverMode             = os.Getenv("DRIVER_MODE")
 	podWatcherResyncPeriod = time.Minute
 	scheme                 = runtime.NewScheme()
+)
+
+const (
+	// DriverModePod is the default V2 mode using Mountpoint Pods.
+	DriverModePod = "pod"
+	// DriverModeDaemonset uses the two-daemonset architecture.
+	DriverModeDaemonset = "daemonset"
 )
 
 func init() {
@@ -118,27 +128,47 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 	stopCh := make(chan struct{})
 
 	mpMounter := mpmounter.New()
-	podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
-	err = podWatcher.Start(stopCh)
-	if err != nil {
-		klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+
+	var m mounter.Mounter
+
+	if driverMode == DriverModeDaemonset {
+		// Daemonset mode: the mounter DaemonSet is already running on this node.
+		// No controller, no S3PA CRD, no Mountpoint Pods.
+		klog.Info("Running in daemonset mode — skipping controller-related setup")
+
+		commDir := filepath.Join(util.ContainerKubeletPath(), "plugins", "s3.csi.aws.com", "comm")
+		m = mounter.NewDaemonsetNodeMounter(
+			mpMounter,
+			commDir,
+			credProvider,
+			nil, // mountSyscall — use platform default
+			nil, // bindMountSyscall — use platform default
+			kubernetesVersion,
+			variant,
+		)
+	} else {
+		// Pod mode (default): V2 architecture with Mountpoint Pods.
+		podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
+		err = podWatcher.Start(stopCh)
+		if err != nil {
+			klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+		}
+
+		s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
+
+		unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
+		podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
+		go unmounter.StartPeriodicCleanup(stopCh)
+
+		podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
+			kubernetesVersion, nodeID, variant)
+		if err != nil {
+			klog.Fatalln(err)
+		}
+		m = podMounter
 	}
 
-	s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
-
-	unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
-
-	podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
-
-	go unmounter.StartPeriodicCleanup(stopCh)
-
-	podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
-		kubernetesVersion, nodeID, variant)
-	if err != nil {
-		klog.Fatalln(err)
-	}
-
-	nodeServer := node.NewS3NodeServer(nodeID, podMounter)
+	nodeServer := node.NewS3NodeServer(nodeID, m)
 
 	return &Driver{
 		Endpoint:   endpoint,

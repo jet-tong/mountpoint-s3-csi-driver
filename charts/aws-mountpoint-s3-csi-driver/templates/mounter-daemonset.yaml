@@ -1,0 +1,70 @@
+{{- if eq .Values.mode "daemonset" }}
+# Secondary DaemonSet: runs mount-s3 processes as children.
+# Only deployed in daemonset mode. Communicates with the CSI node service
+# (primary DaemonSet) via a shared Unix socket on a hostPath volume.
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: s3-csi-mounter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: s3-csi-mounter
+      {{- include "aws-mountpoint-s3-csi-driver.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    # OnDelete: pods are not automatically replaced on update.
+    # Upgrades require node draining (cordon → drain → delete pod → uncordon).
+    # This is necessary because restarting the mounter kills all mount-s3
+    # children, breaking active FUSE mounts on the node.
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: s3-csi-mounter
+        {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.node.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      serviceAccountName: {{ .Values.node.serviceAccount.name }}
+      priorityClassName: system-node-critical
+      tolerations:
+        {{- if .Values.node.tolerateAllTaints }}
+        - operator: Exists
+        {{- end }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+      {{- range .Values.imagePullSecrets }}
+        - name: {{ . }}
+      {{- end }}
+      {{- end }}
+      containers:
+        - name: mounter
+          image: {{ include "csiDriverImageName" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/aws-s3-csi-daemonset-mounter"]
+          args:
+            - --comm-dir={{ trimSuffix "/" .Values.node.kubeletPath }}/plugins/s3.csi.aws.com/comm
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: comm-dir
+              mountPath: {{ trimSuffix "/" .Values.node.kubeletPath }}/plugins/s3.csi.aws.com/comm
+      volumes:
+        - name: comm-dir
+          hostPath:
+            path: {{ trimSuffix "/" .Values.node.kubeletPath }}/plugins/s3.csi.aws.com/comm/
+            type: DirectoryOrCreate
+{{- end }}
