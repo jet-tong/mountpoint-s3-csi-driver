@@ -101,6 +101,8 @@ spec:
               value: {{ .Values.eksPodIdentityAgent.containerCredentialsFullURI }}
             - name: INSTALLATION_TYPE
               value: {{ if .Values.isEKSAddon }}eks-addon{{ else }}helm{{ end }}
+            - name: DRIVER_MODE
+              value: {{ .Values.experimental.driverMode }}
             {{- with .Values.awsAccessSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
