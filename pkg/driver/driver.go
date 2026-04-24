@@ -62,6 +62,7 @@ const (
 
 var (
 	mountpointPodNamespace = os.Getenv("MOUNTPOINT_NAMESPACE")
+	driverMode             = os.Getenv("DRIVER_MODE")
 	podWatcherResyncPeriod = time.Minute
 	scheme                 = runtime.NewScheme()
 )
@@ -105,8 +106,8 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 	installMethod := cluster.InstallationMethod()
 
 	version := version.GetVersion()
-	klog.Infof("Driver version: %v, Git commit: %v, build date: %v, nodeID: %v, mount-s3 version: %v, kubernetes version: %v, variant: %s, install: %v",
-		version.DriverVersion, version.GitCommit, version.BuildDate, nodeID, mpVersion, kubernetesVersion, variant.String(), installMethod)
+	klog.Infof("Driver version: %v, Git commit: %v, build date: %v, nodeID: %v, mount-s3 version: %v, kubernetes version: %v, variant: %s, install: %v, mode: %v",
+		version.DriverVersion, version.GitCommit, version.BuildDate, nodeID, mpVersion, kubernetesVersion, variant.String(), installMethod, driverMode)
 	// `credentialprovider.RegionFromIMDSOnce` is a `sync.OnceValues` and it only makes request to IMDS once,
 	// this call is basically here to pre-warm the cache of IMDS call.
 	go func() {
@@ -124,21 +125,33 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 		klog.Fatalf("Failed to start Pod watcher: %v\n", err)
 	}
 
-	s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
+	var mntr mounter.Mounter
+	switch driverMode {
+	case "daemonset":
+		klog.Info("DRIVER_MODE=daemonset: using DaemonsetMounter")
+		mntr, err = mounter.NewDaemonsetMounter(podWatcher, credProvider, mpMounter,
+			kubernetesVersion, nodeID, variant)
+		if err != nil {
+			klog.Fatalln(err)
+		}
+	case "pod", "":
+		klog.Info("DRIVER_MODE=pod: using PodMounter")
+		s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
 
-	unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
+		unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
+		podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
+		go unmounter.StartPeriodicCleanup(stopCh)
 
-	podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
-
-	go unmounter.StartPeriodicCleanup(stopCh)
-
-	podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
-		kubernetesVersion, nodeID, variant)
-	if err != nil {
-		klog.Fatalln(err)
+		mntr, err = mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
+			kubernetesVersion, nodeID, variant)
+		if err != nil {
+			klog.Fatalln(err)
+		}
+	default:
+		klog.Fatalf("Invalid DRIVER_MODE %q: must be 'pod' or 'daemonset'", driverMode)
 	}
 
-	nodeServer := node.NewS3NodeServer(nodeID, podMounter)
+	nodeServer := node.NewS3NodeServer(nodeID, mntr)
 
 	return &Driver{
 		Endpoint:   endpoint,

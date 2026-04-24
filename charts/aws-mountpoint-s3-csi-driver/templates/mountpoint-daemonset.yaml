@@ -1,0 +1,55 @@
+{{- if eq .Values.experimental.driverMode "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: s3-csi-mountpoint
+  namespace: {{ .Values.mountpointPod.namespace }}
+  labels:
+    app.kubernetes.io/name: s3-csi-mountpoint
+    {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 4 }}
+    s3.csi.aws.com/mounted-by-csi-driver-version: {{ .Chart.AppVersion }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3-csi-mountpoint
+  updateStrategy:
+    # Note that this is not a "rolling update" but rather a "recreate" style update.
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3-csi-mountpoint
+        # TODO: s3.csi.aws.com/mountpoint-version once wired into Helm values
+    spec:
+      priorityClassName: mount-s3-critical
+      # TODO: serviceAccountName for daemonset mode
+      tolerations:
+      - operator: Exists
+      securityContext:
+        # TODO: use isOpenShift helper to conditionally set fsGroup/runAsUser
+        # (OpenShift auto-assigns UIDs from namespace range; hardcoded 1000 will fail)
+        fsGroup: 1000
+      containers:
+      - name: mountpoint
+        image: {{ include "csiDriverImageName" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/bin/aws-s3-csi-mounter"]
+        # TODO: drop when entrypoint becomes a long-running accept loop.
+        args: ["--mount-sock-recv-timeout=24h"]
+        securityContext:
+          runAsUser: 1000
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: comm
+          mountPath: /comm
+      volumes:
+      - name: comm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 10Mi
+{{- end }}
