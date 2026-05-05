@@ -187,6 +187,10 @@ deploy_containers() {
     # Restart the node and controller pods
     kubectl -n kube-system delete po -lapp=s3-csi-controller
     kubectl -n kube-system delete po -lapp=s3-csi-node
+
+    # Restart the mountpoint DS pod (OnDelete strategy means helm upgrade alone won't recreate it).
+    # (+ suppress error when namespace doesn't exist on first deploy)
+    kubectl -n mount-s3 delete pod -lapp.kubernetes.io/name=s3-csi-mountpoint --ignore-not-found 2>/dev/null || true
 }
 
 deploy() {

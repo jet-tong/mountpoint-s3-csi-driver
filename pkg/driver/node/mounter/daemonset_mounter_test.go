@@ -1,6 +1,7 @@
 package mounter
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -36,14 +37,19 @@ func TestDaemonsetMounter(t *testing.T) {
 					Namespace: testNamespace,
 					Labels:    map[string]string{daemonsetLabelKey: daemonsetLabelValue},
 				},
-				Spec: corev1.PodSpec{NodeName: testNode},
+				Spec:   corev1.PodSpec{NodeName: testNode},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
 			},
 		)
 		w := startWatcher(t, client)
 
-		name, err := getDaemonsetMounterPodName(w)
+		dm, err := NewDaemonsetMounter(w, nil, nil, "v1.36.0", testNode, cluster.DefaultKubernetes)
 		assert.NoError(t, err)
-		assert.Equals(t, "s3-csi-mountpoint-abcde", name)
+
+		pod, podPath, err := dm.getDaemonsetMounterPodWithRetry(context.Background())
+		assert.NoError(t, err)
+		assert.Equals(t, "s3-csi-mountpoint-abcde", pod.Name)
+		assert.Equals(t, true, podPath != "")
 	})
 
 	// TODO: add test groups as daemonset mode implementation grows:

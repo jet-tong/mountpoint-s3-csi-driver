@@ -129,6 +129,8 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 	switch driverMode {
 	case "daemonset":
 		klog.Info("DRIVER_MODE=daemonset: using DaemonsetMounter")
+		//  No unmounter needed — daemonset mode handles source FUSE cleanup inline in Unmount().
+		// TODO: make sure any logic like StartPeriodicCleanup is handled for daemonset mode too.
 		mntr, err = mounter.NewDaemonsetMounter(podWatcher, credProvider, mpMounter,
 			kubernetesVersion, nodeID, variant)
 		if err != nil {

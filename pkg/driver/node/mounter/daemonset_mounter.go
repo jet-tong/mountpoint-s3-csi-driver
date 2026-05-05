@@ -10,10 +10,17 @@ package mounter
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	k8sstrings "k8s.io/utils/strings"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/cluster"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -21,6 +28,7 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint"
 	mpmounter "github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/podmounter/mppod/watcher"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 // Labels identifying the Mountpoint DaemonSet Pod on this node.
@@ -37,9 +45,12 @@ const (
 // Mount orchestration.
 // TODO: Remove PodMounter references and split helper functions out.
 type DaemonsetMounter struct {
-	// pm provides access to shared helper methods. DaemonsetMounter does NOT
-	// call pm.Mount — it has its own Mount implementation.
 	pm *PodMounter
+
+	podWatcher  *watcher.Watcher
+	mount       *mpmounter.Mounter
+	kubeletPath string
+	mu          sync.Mutex
 }
 
 // NewDaemonsetMounter creates a DaemonsetMounter backed by a PodMounter for
@@ -58,7 +69,12 @@ func NewDaemonsetMounter(
 	if err != nil {
 		return nil, err
 	}
-	return &DaemonsetMounter{pm: pm}, nil
+	return &DaemonsetMounter{
+		pm:          pm,
+		podWatcher:  podWatcher,
+		mount:       mount,
+		kubeletPath: util.ContainerKubeletPath(),
+	}, nil
 }
 
 // Mount mounts the given bucketName at the target path using the on-node
@@ -84,25 +100,18 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		}
 	}
 
-	// Step 1: Find the DaemonSet Pod on this node.
-	mpPodName, err := getDaemonsetMounterPodName(dm.pm.podWatcher)
+	// Step 1-2: Find and get pod
+	pod, podPath, err := dm.getDaemonsetMounterPodWithRetry(ctx)
 	if err != nil {
-		klog.Errorf("Failed to find Mountpoint DaemonSet Pod for %q: %v", target, err)
-		return fmt.Errorf("Failed to find Mountpoint DaemonSet Pod: %w", err)
+		klog.Errorf("Failed to find running Mountpoint DaemonSet Pod for %q: %v", target, err)
+		return fmt.Errorf("Failed to find running Mountpoint DaemonSet Pod: %w", err)
 	}
 
-	// Step 2: Wait for the Pod to be Running.
-	pod, podPath, err := dm.pm.waitForMountpointPod(ctx, mpPodName)
-	if err != nil {
-		klog.Errorf("Failed to wait for Mountpoint DaemonSet Pod %q to be ready for %q: %v", mpPodName, target, err)
-		return fmt.Errorf("Failed to wait for Mountpoint DaemonSet Pod %q to be ready: %w", mpPodName, err)
-	}
-	unlockMountpointPod := lockMountpointPod(mpPodName)
-	defer unlockMountpointPod()
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
 
-	// TODO: sanitize VolumeID before using as path component (see credentialprovider's
-	// use of k8s.io/utils/strings.EscapeQualifiedName for similar purpose).
-	source := filepath.Join(SourceMountDir(dm.pm.kubeletPath), credentialCtx.VolumeID)
+	// Sanitize VolumeID before using as a path component
+	source := dm.sourcePath(credentialCtx.VolumeID)
 	isSourceMountPoint, err := dm.IsMountPoint(source)
 	if err != nil {
 		err = dm.pm.verifyOrSetupMountTarget(source, err)
@@ -111,13 +120,9 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		}
 	}
 
-	// Step 3: Provide credentials.
-	// For daemonset MVP, driver-level credentials only (no pod-level IRSA role ARN).
-	credEnv, authenticationSource, err := dm.pm.provideCredentials(ctx, podPath, string(pod.UID), "", credentialCtx)
-	if err != nil {
-		klog.Errorf("Failed to provide credentials for %q: %v", source, err)
-		return fmt.Errorf("Failed to provide credentials for %q: %w", source, err)
-	}
+	// Step 3: Credentials.
+	credEnv := envprovider.Environment{}
+	authenticationSource := credentialprovider.AuthenticationSourceDriver
 
 	// Steps 4-6: FUSE mount + send options + wait for mount.
 	if !isSourceMountPoint {
@@ -133,7 +138,7 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	}
 
 	// Step 6: Bind mount source to target.
-	err = dm.pm.bindMountSyscallWithDefault(source, target)
+	err = dm.mount.BindMount(source, target)
 	if err != nil {
 		klog.Errorf("Failed to bind mount %q to target %q: %v", source, target, err)
 		return fmt.Errorf("Failed to bind mount %q to target %q: %w", source, target, err)
@@ -143,34 +148,94 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	return nil
 }
 
-// Unmount unmounts the bind mount at target. For daemonset MVP, delegates to
-// PodMounter's Unmount which handles bind-mount removal.
-// TODO: source FUSE mount cleanup — after unmounting the bind mount, the source
-// FUSE mount at SourceMountDir/{VolumeID} persists until the DS pod restarts.
-// For multi-mount support, add explicit source unmount when refcount reaches zero.
+// Unmount unmounts both the bind mount at target and the source FUSE mount.
+// Unlike pod-mode which splits unmount across PodMounter (bind mount) and
+// PodUnmounter (source FUSE, triggered by controller).
 func (dm *DaemonsetMounter) Unmount(ctx context.Context, target string, credentialCtx credentialprovider.CleanupContext) error {
-	return dm.pm.Unmount(ctx, target, credentialCtx)
+	// 1. Unmount the bind mount at target
+	err := dm.mount.Unmount(target)
+	// TODO: Handle systemd logic like PodMounter.Unmount
+	if err != nil {
+		klog.Errorf("Failed to unmount %q: %v", target, err)
+		return fmt.Errorf("Failed to unmount %q: %w", target, err)
+	}
+
+	// Lock serializes all mount/unmount operations on source paths.
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// 2. Unmount the source FUSE mount.
+	// TODO: continue adapting this based on PodUnmounter.unmountAndRemoveMountpointSource(): (or extract common parts elsewhere)
+	source := dm.sourcePath(credentialCtx.VolumeID)
+	isMountpoint, err := dm.mount.CheckMountpoint(source)
+	isCorruptedMountpoint := err != nil && dm.mount.IsMountpointCorrupted(err)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		// Target does not exist, nothing to do
+		return nil
+	} else if err != nil && !isCorruptedMountpoint {
+		return fmt.Errorf("failed to check source mountpoint %q: %w", source, err)
+	}
+	// TODO: PodUnmounter.waitUntilMountpointIsUnused - wait till all references to Mountpoint at source is gone, not needed without pod sharing.
+	// TODO: PodUnmounter.waitUntilMountpointIsUnmounted like in PodUnmounter - wait till Mountpoint at source is unmounted
+
+	if isMountpoint || isCorruptedMountpoint {
+		if err := dm.mount.Unmount(source); err != nil {
+			klog.Errorf("failed to unmount source Mountpoint %q: %v", source, err)
+			return fmt.Errorf("failed to unmount source Mountpoint %q: %w", source, err)
+		}
+		klog.Infof("Unmounted source FUSE mount %s", source)
+	}
+
+	// Now we know there is no Mountpoint at `source`, and it should be a regular directory. Let's remove it.
+	if err := os.Remove(source); err != nil {
+		return fmt.Errorf("failed to remove source directory of source Mountpoint %q: %w", source, err)
+	}
+
+	return nil
 }
 
 // IsMountPoint checks whether target is a mountpoint.
 func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
-	return dm.pm.IsMountPoint(target)
+	return dm.mount.CheckMountpoint(target)
 }
 
-// getDaemonsetMounterPodName returns the name of the on-node Mountpoint DaemonSet Pod
-// from the watcher's cache.
-func getDaemonsetMounterPodName(w *watcher.Watcher) (string, error) {
-	pods, err := w.List()
-	if err != nil {
-		return "", fmt.Errorf("list pods from watcher: %w", err)
-	}
-	for _, p := range pods {
-		if p.Labels[daemonsetLabelKey] == daemonsetLabelValue {
-			return p.Name, nil
+// podPath returns `pod`'s basepath inside kubelet's path.
+func (dm *DaemonsetMounter) podPath(podUID string) string {
+	return filepath.Join(dm.kubeletPath, "pods", podUID)
+}
+
+// sourcePath returns the source mount directory for the given volumeID.
+func (dm *DaemonsetMounter) sourcePath(volumeID string) string {
+	return filepath.Join(SourceMountDir(dm.kubeletPath), k8sstrings.EscapeQualifiedName(volumeID))
+}
+
+// getDaemonsetMounterPodWithRetry finds the running Mountpoint DaemonSet Pod on this
+// node, retrying until the pod appears in the watcher cache or the context expires.
+func (dm *DaemonsetMounter) getDaemonsetMounterPodWithRetry(ctx context.Context) (*corev1.Pod, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, mountpointPodReadinessWaitDuration)
+	defer cancel()
+
+	for {
+		pods, err := dm.podWatcher.List()
+		if err != nil {
+			return nil, "", fmt.Errorf("list pods from watcher: %w", err)
+		}
+		for i := range pods {
+			if pods[i].Labels[daemonsetLabelKey] == daemonsetLabelValue &&
+				pods[i].Status.Phase == corev1.PodRunning {
+				pod := pods[i]
+				klog.V(4).Infof("Mountpoint DaemonSet Pod %s/%s is running with id %s", pod.Namespace, pod.Name, pod.UID)
+				return pod, dm.podPath(string(pod.UID)), nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, "", fmt.Errorf("timed out waiting for Mountpoint DaemonSet Pod "+
+				"(label %s=%s) to be running: %w", daemonsetLabelKey, daemonsetLabelValue, ctx.Err())
+		case <-time.After(mountpointPodAttachmentPollInterval):
 		}
 	}
-	return "", fmt.Errorf("no Mountpoint DaemonSet pod found on this node (label %s=%s)",
-		daemonsetLabelKey, daemonsetLabelValue)
 }
 
 // Compile-time check that DaemonsetMounter implements Mounter.

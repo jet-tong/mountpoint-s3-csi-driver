@@ -21,7 +21,7 @@ spec:
         app.kubernetes.io/name: s3-csi-mountpoint
         # TODO: s3.csi.aws.com/mountpoint-version once wired into Helm values
     spec:
-      priorityClassName: mount-s3-critical
+      priorityClassName: system-node-critical
       # TODO: serviceAccountName for daemonset mode
       tolerations:
       - operator: Exists
