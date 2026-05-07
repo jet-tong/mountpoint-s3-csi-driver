@@ -101,7 +101,7 @@ spec:
               value: {{ .Values.eksPodIdentityAgent.containerCredentialsFullURI }}
             - name: INSTALLATION_TYPE
               value: {{ if .Values.isEKSAddon }}eks-addon{{ else }}helm{{ end }}
-            {{- if eq .Values.mounterMode "daemonset" }}
+            {{- if eq .Values.experimental.mounterMode "daemonset" }}
             - name: MOUNTER_MODE
               value: daemonset
             {{- end }}

@@ -5,9 +5,6 @@
 # If not set, auto-detects OpenShift where possible.
 isOpenShift: null
 
-# Mounter mode: "pod" (V2 default, one pod per mount) or "daemonset" (all mounts in one pod per node)
-mounterMode: "pod"
-
 image:
   # Our regional ECR repositories are labelled `eks/aws-s3-csi-driver`.
   # See https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html for the per-region registry list.
@@ -133,6 +130,8 @@ eksPodIdentityAgent:
 supportLegacySystemDMounts: true
 
 experimental:
+  # Mounter mode: "pod" (V2 default, one pod per mount) or "daemonset" (all mounts in one pod per node)
+  mounterMode: "pod"
   # Enables support for `s3.csi.aws.com/reserve-headroom-for-mppod` scheduling gate on the Workload Pods.
   # See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/HEADROOM_FOR_MPPOD.md for more details.
   reserveHeadroomForMountpointPods: false
@@ -140,7 +139,7 @@ experimental:
   headroomPodLabels: {}
 
 # Configuration for the secondary (mounter) daemonset.
-# Only used when mounterMode is "daemonset".
+# Only used when experimental.mounterMode is "daemonset".
 mounterDaemonset:
   resources:
     requests:

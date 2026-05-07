@@ -1,4 +1,4 @@
-{{- if and .Values.mountpointPod.createNamespace (ne .Values.mounterMode "daemonset") }}
+{{- if and .Values.mountpointPod.createNamespace (ne .Values.experimental.mounterMode "daemonset") }}
 ---
 apiVersion: v1
 kind: Namespace

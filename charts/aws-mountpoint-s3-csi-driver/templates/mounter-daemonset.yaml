@@ -1,4 +1,4 @@
-{{- if eq .Values.mounterMode "daemonset" }}
+{{- if eq .Values.experimental.mounterMode "daemonset" }}
 kind: DaemonSet
 apiVersion: apps/v1
 metadata:
@@ -61,6 +61,12 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            runAsUser: 1000
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: comm
               mountPath: /comm
