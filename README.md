@@ -1,6 +1,6 @@
 # Mountpoint for Amazon S3 CSI Driver
 
-> [!TIP]
+> [!TIP] 
 > [Mountpoint for Amazon S3 CSI Driver v2](https://github.com/awslabs/mountpoint-s3-csi-driver/issues/504) is available!
 >
 > The v2 introduces [Mountpoint Pod sharing](docs/MOUNTPOINT_POD_SHARING.md), [EKS Pod Identity support](docs/CONFIGURATION.md#driver-level-credentials-with-eks-pod-identity), support for running on SELinux-enabled environments like [ROSA](https://aws.amazon.com/rosa/), [simplified caching configuration](docs/CACHING.md) and more!
