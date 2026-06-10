@@ -65,3 +65,4 @@ jobs:
           else
             echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'
           fi
+
