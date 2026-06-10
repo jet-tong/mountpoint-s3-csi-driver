@@ -8,6 +8,17 @@ permissions:
   contents: read
 
 jobs:
+  debug-refs:
+    name: Debug GitHub Context
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "ref_name: ${{ github.ref_name }}"
+          echo "ref: ${{ github.ref }}"
+          echo "base_ref: ${{ github.base_ref }}"
+          echo "head_ref: ${{ github.head_ref }}"
+          echo "event.pull_request.base.ref: ${{ github.event.pull_request.base.ref }}"
+          echo "event_name: ${{ github.event_name }}"
   approval:
     name: Approval Gate
     environment: "approval-gate"
@@ -32,7 +43,7 @@ jobs:
   e2e-rosa:
     name: E2E ROSA Tests
     # Temporarily skipping rosa tests for feature/daemonset-architecture branch
-    if: github.ref_name != 'feature/daemonset-architecture' 
+    if: ${{ github.event.pull_request.base.ref != 'feature/daemonset-architecture' }}
     uses: ./.github/workflows/e2e-rosa-tests.yaml
     needs: approval
     with:
@@ -49,7 +60,7 @@ jobs:
     steps:
       - name: Verify jobs succeeded
         run: |
-          if [[ "${{ github.base_ref }}" == "feature/daemonset-architecture" ]]; then
+          if [[ "${{ github.event.pull_request.base.ref }}" == "feature/daemonset-architecture" ]]; then
             echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")'
           else
             echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'
