@@ -465,15 +465,10 @@ func (t *s3CSIUpgradeTestSuite) DefineTests(driver storageframework.TestDriver, 
 	}
 }
 
-// buildHelmValues creates common Helm values for install/upgrade
-func buildHelmValues() map[string]any {
-	values := map[string]any{
-		"node": map[string]any{
-			"podInfoOnMountCompat": map[string]any{
-				"enable": "true",
-			},
-		},
-	}
+// buildHelmValuesForUpgrade creates Helm values for upgrade/install of the new version,
+// overriding the image to the CI-built container.
+func buildHelmValuesForUpgrade() map[string]any {
+	values := buildHelmValuesBase()
 	if helmChartContainerRepository != "" && helmChartContainerTag != "" {
 		values["image"] = map[string]any{
 			"repository": helmChartContainerRepository,
@@ -481,6 +476,19 @@ func buildHelmValues() map[string]any {
 		}
 	}
 	return values
+}
+
+// buildHelmValuesBase creates Helm values without image overrides, allowing the
+// chart's default image to be used. This is appropriate when installing a previous
+// release version where the chart and image must match.
+func buildHelmValuesBase() map[string]any {
+	return map[string]any{
+		"node": map[string]any{
+			"podInfoOnMountCompat": map[string]any{
+				"enable": "true",
+			},
+		},
+	}
 }
 
 // getLatestReleasedVersion retrieves the latest published release version to upgrade from.
@@ -608,7 +616,7 @@ func installCSIDriver(cfg *action.Configuration, version string, chartPath strin
 	chart, err := loader.Load(chartPath)
 	framework.ExpectNoError(err)
 
-	release, err := installClient.RunWithContext(context.Background(), chart, buildHelmValues())
+	release, err := installClient.RunWithContext(context.Background(), chart, buildHelmValuesBase())
 	framework.ExpectNoError(err)
 
 	framework.Logf("Helm release %q created", release.Name)
@@ -651,7 +659,7 @@ func upgradeCSIDriver(cfg *action.Configuration, f *framework.Framework, version
 	chart, err := loader.Load(chartPath)
 	framework.ExpectNoError(err)
 
-	release, err := upgradeClient.RunWithContext(context.Background(), helmReleaseName, chart, buildHelmValues())
+	release, err := upgradeClient.RunWithContext(context.Background(), helmReleaseName, chart, buildHelmValuesForUpgrade())
 	framework.ExpectNoError(err)
 
 	framework.Logf("Helm release %q updated to %v (from %q)", release.Name, version, chartPath)
