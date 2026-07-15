@@ -18,6 +18,7 @@ export REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
 BASE_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 source "${BASE_DIR}"/eksctl.sh
 source "${BASE_DIR}"/helm.sh
+source "${BASE_DIR}"/karpenter.sh
 
 TEST_DIR=${BASE_DIR}/../csi-test-artifacts
 BIN_DIR=${TEST_DIR}/bin
@@ -45,6 +46,8 @@ if [[ "${CLUSTER_TYPE}" == "openshift" ]]; then
 elif [[ "${CLUSTER_TYPE}" == "eksctl" ]]; then
     # EKS does not allow cluster names with ".", we're replacing them with "-".
     CLUSTER_NAME="s3-csi-cluster-${CLUSTER_TYPE}-${AMI_FAMILY,,}-${ARCH}-${K8S_VERSION_EKSCTL/./-}"
+elif [[ "${CLUSTER_TYPE}" == "karpenter" ]]; then
+    CLUSTER_NAME=${CLUSTER_NAME:-"s3-csi-karpenter"}
 else
     echo "Unsupported cluster type: ${CLUSTER_TYPE}."
     exit 1
@@ -117,6 +120,11 @@ function create_cluster() {
       "$AMI_FAMILY" \
       "$K8S_VERSION_EKSCTL" \
       "$EKSCTL_PATCH_SELINUX_ENFORCING_FILE"
+  elif [[ "${CLUSTER_TYPE}" == "karpenter" ]]; then
+    karpenter_create_cluster \
+      "$CLUSTER_NAME" \
+      "$REGION" \
+      "$KUBECONFIG"
   fi
 }
 
@@ -127,11 +135,18 @@ function delete_cluster() {
       "$CLUSTER_NAME" \
       "$REGION" \
       "${FORCE:-}"
+  elif [[ "${CLUSTER_TYPE}" == "karpenter" ]]; then
+    karpenter_delete_cluster \
+      "$CLUSTER_NAME" \
+      "$REGION" \
+      "$KUBECONFIG"
   fi
 }
 
 function update_kubeconfig() {
   if [[ "${CLUSTER_TYPE}" == "eksctl" ]]; then
+    aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${REGION} --kubeconfig=${KUBECONFIG}
+  elif [[ "${CLUSTER_TYPE}" == "karpenter" ]]; then
     aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${REGION} --kubeconfig=${KUBECONFIG}
   fi
 }
@@ -168,11 +183,16 @@ elif [[ "${ACTION}" == "install_driver" ]]; then
     "${TAG}" \
     "${KUBECONFIG}" \
     "${CSI_DRIVER_IRSA_ROLE_ARN}" \
-    "${CLUSTER_TYPE}"
+    "${CLUSTER_TYPE}" \
+    "${MOUNTER_MODE:-pod}"
 elif [[ "${ACTION}" == "run_tests" ]]; then
   set +e
   pushd tests/e2e-kubernetes
-  KUBECONFIG=${KUBECONFIG} ginkgo -p -vv --github-output -timeout 60m -- --bucket-region=${REGION} --commit-id=${TAG} --bucket-prefix=${CLUSTER_NAME} --imds-available=${IMDS_AVAILABLE} --cluster-name=${CLUSTER_NAME} --cluster-type=${CLUSTER_TYPE}
+  FOCUS_FLAG=""
+  if [[ -n "${GINKGO_FOCUS:-}" ]]; then
+    FOCUS_FLAG="--focus=${GINKGO_FOCUS}"
+  fi
+  KUBECONFIG=${KUBECONFIG} ginkgo -p -vv --github-output -timeout 60m ${FOCUS_FLAG} -- --bucket-region=${REGION} --commit-id=${TAG} --bucket-prefix=${CLUSTER_NAME} --imds-available=${IMDS_AVAILABLE} --cluster-name=${CLUSTER_NAME} --cluster-type=${CLUSTER_TYPE}
   EXIT_CODE=$?
   print_cluster_info
   exit $EXIT_CODE

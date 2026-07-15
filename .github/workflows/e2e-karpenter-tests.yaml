@@ -1,0 +1,139 @@
+name: E2E Karpenter Tests
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options:
+          - trusted
+          - us-east-1-untrusted
+      ref:
+        type: string
+        default: feature/daemonset-architecture
+
+concurrency:
+  group: e2e-karpenter-${{ inputs.environment }}
+  queue: max
+
+env:
+  IMAGE_NAME: "s3-csi-driver"
+  TAG_UNTESTED: "untested_${{ inputs.ref }}"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04 # FIXME - https://github.com/actions/runner-images/issues/11471
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.IAM_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag, and push docker image to Amazon ECR Private Repository
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          PLATFORM: "linux/amd64"
+          TAG: "${{ env.TAG_UNTESTED }}"
+        run: |
+          make -j `nproc` all-push-skip-if-present
+
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 45
+    env:
+      AWS_REGION: "${{ vars.AWS_REGION }}"
+      CLUSTER_TYPE: "karpenter"
+      TAG: "untested_${{ inputs.ref }}"
+      MOUNTER_MODE: "daemonset"
+      GINKGO_FOCUS: "autoscaler"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.IAM_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Install tools
+        env:
+          ACTION: "install_tools"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Create or reuse Karpenter cluster
+        id: create_cluster
+        env:
+          ACTION: "create_cluster"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Update kubeconfig
+        env:
+          ACTION: "update_kubeconfig"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Install the driver (daemonset mode)
+        env:
+          ACTION: "install_driver"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Run autoscaler tests
+        env:
+          ACTION: "run_tests"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Post e2e cleanup
+        if: always()
+        env:
+          ACTION: "e2e_cleanup"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      - name: Uninstall the driver
+        if: ${{ always() && steps.create_cluster.conclusion == 'success' }}
+        env:
+          ACTION: "uninstall_driver"
+        run: tests/e2e-kubernetes/scripts/run.sh
+
+      # Semi-persistent: don't delete cluster (reused <3 days)
