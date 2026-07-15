@@ -1,0 +1,40 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: ${CLUSTER_NAME}
+  region: ${AWS_REGION}
+  version: "1.32"
+  tags:
+    karpenter.sh/discovery: ${CLUSTER_NAME}
+
+iam:
+  withOIDC: true
+
+karpenter:
+  version: "1.13.0"
+  withSpotInterruptionQueue: true
+
+managedNodeGroups:
+  - name: system
+    instanceType: m5.large
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 3
+    amiFamily: AmazonLinux2023
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      attachPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3express:*"
+            Resource: "*"
+
+addons:
+  - name: eks-pod-identity-agent
