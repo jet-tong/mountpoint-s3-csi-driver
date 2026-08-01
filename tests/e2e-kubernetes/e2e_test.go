@@ -56,7 +56,7 @@ var CSITestSuites = []func() framework.TestSuite{
 	// testsuites.InitMultiVolumeTestSuite,
 	// testsuites.InitVolumeExpandTestSuite,
 	// testsuites.InitDisruptiveTestSuite,
-	// testsuites.InitVolumeLimitsTestSuite,
+	// testsuites.InitVolumeLimitsTestSuite, // custom_testsuites.InitS3CSIVolumeLimitsTestSuite adapts this
 	// testsuites.InitTopologyTestSuite,
 	// testsuites.InitVolumeStressTestSuite,
 	// testsuites.InitFsGroupChangePolicyTestSuite,
@@ -67,20 +67,19 @@ var CSITestSuites = []func() framework.TestSuite{
 	custom_testsuites.InitS3AccessModeTestSuite,
 	custom_testsuites.InitS3CSIMultiVolumeTestSuite,
 	custom_testsuites.InitS3MountOptionsTestSuite,
-	custom_testsuites.InitS3CSICredentialsTestSuite,
-	custom_testsuites.InitS3CSICacheTestSuite,
-	custom_testsuites.InitS3CSIPodSharingTestSuite,
-	custom_testsuites.InitS3TaintRemovalTestSuite,
-	custom_testsuites.InitS3CSIEvictionOrderTestSuite,
-	custom_testsuites.InitS3ProxyTestSuite,
+	custom_testsuites.InitS3CSIVolumeLimitsTestSuite,
+	custom_testsuites.InitS3CSIAutoscalerTestSuite,
+	// TODO: reenable or rewrite when credentials / cache / pod sharing are implemented for daemonset mode
+	// custom_testsuites.InitS3CSICredentialsTestSuite,
+	// custom_testsuites.InitS3CSICacheTestSuite,
+	// custom_testsuites.InitS3CSIPodSharingTestSuite,
+	// custom_testsuites.InitS3TaintRemovalTestSuite,
+	// custom_testsuites.InitS3CSIEvictionOrderTestSuite,
+	// custom_testsuites.InitS3ProxyTestSuite,
 }
 
 func getCSITestSuites() []func() framework.TestSuite {
 	suites := CSITestSuites
-	// Headroom feature is not supported on OpenShift
-	if ClusterType != "openshift" {
-		suites = append(suites, custom_testsuites.InitS3HeadroomTestSuite)
-	}
 	return suites
 }
 

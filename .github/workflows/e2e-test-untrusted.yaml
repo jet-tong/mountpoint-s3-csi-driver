@@ -31,12 +31,18 @@ jobs:
     secrets: inherit
   e2e-rosa:
     name: E2E ROSA Tests
-    # Temporarily skipping rosa tests for feature/daemonset-architecture branch
-    if: github.ref_name != 'feature/daemonset-architecture' 
     uses: ./.github/workflows/e2e-rosa-tests.yaml
     needs: approval
     with:
       environment: "rosa-untrusted"
+      ref: ${{ github.event.pull_request.head.sha }}
+    secrets: inherit
+  e2e-karpenter:
+    name: E2E Karpenter Tests
+    uses: ./.github/workflows/e2e-karpenter-tests.yaml
+    needs: approval
+    with:
+      environment: "us-east-1-untrusted"
       ref: ${{ github.event.pull_request.head.sha }}
     secrets: inherit
   outcome:
@@ -46,11 +52,7 @@ jobs:
     needs:
       - e2e
       - e2e-rosa
+      - e2e-karpenter
     steps:
       - name: Verify jobs succeeded
-        run: |
-          if [[ "${{ github.base_ref }}" == "feature/daemonset-architecture" ]]; then
-            echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")'
-          else
-            echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'
-          fi
+        run: echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'

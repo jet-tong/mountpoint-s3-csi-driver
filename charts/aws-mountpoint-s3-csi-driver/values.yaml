@@ -1,6 +1,12 @@
 # Default values for Mountpoint for Amazon S3 CSI Driver Helm chart.
 # You can customize any values here during installation.
 
+# Automatically set to true when the chart is published to the official Helm repository.
+# Installing directly from a GitHub branch is not supported.
+# Use the Helm repository (https://awslabs.github.io/mountpoint-s3-csi-driver) or EKS Addon instead.
+# See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/INSTALL.md for details.
+isHelmRepo: false
+
 # Set to true if running on OpenShift/ROSA.
 # If not set, auto-detects OpenShift where possible.
 isOpenShift: null
@@ -12,7 +18,7 @@ image:
   repository: public.ecr.aws/mountpoint-s3-csi-driver/aws-mountpoint-s3-csi-driver
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "v2.6.0"
+  tag: "v2.7.0"
 
 node:
   kubeletPath: /var/lib/kubelet
@@ -135,3 +141,38 @@ experimental:
   reserveHeadroomForMountpointPods: false
   headroomPodImage: public.ecr.aws/eks-distro/kubernetes/pause:3.10
   headroomPodLabels: {}
+  # WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
+  # In-place updates with daemonset mode may not be supported.
+  # Mounter mode: "pod" (V2 default) or "daemonset" (experimental two-daemonset architecture).
+  # In daemonset mode, one mounter daemonset pod handles all mountpoint processes instead of 
+  # one mountpoint pod per workload in pod mode.
+  mounterMode: "daemonset"
+
+# WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
+# Configuration for the secondary mounter daemonset(s).
+# Only used when experimental.mounterMode is "daemonset".
+daemonsetMounters:
+    # Maximum number of distinct S3 volumes (Mountpoint processes) per node.
+    # Advertised to the Kubernetes scheduler via MaxVolumesPerNode.
+    # Shared volumes (same PV used by multiple pods) are counted once.
+  - maxVolumesPerNode: 10
+    # Total resource requests and limits for the mounter DaemonSet pod.
+    # requests.memory should be sized to maxVolumesPerNode × per-mount memory
+    # (e.g., 4 mounts × 512Mi = 2Gi, or 10 mounts × 4Gi = 40Gi).
+    # Please refer to Mountpoint documentation for recommended resource configurations.
+    # TODO: Add link for Mountpoint documentation
+    # requests.cpu should also be sized to maxVolumesPerNode × per-mount CPU
+    # (e.g.  4 mounts × 500Mi = 2000m, or 10 mounts × 500m = 5000m).
+    # TODO: update guidances with memory limiter integration
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+    logLevel: 4
+    podLabels: {}
+    nodeSelector: {}
+    tolerateAllTaints: true
+    defaultTolerations: true
+    tolerations: []
+    affinity: {}
+    imagePullSecrets: []
