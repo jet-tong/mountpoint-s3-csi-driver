@@ -1,0 +1,28 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled (ne .Values.experimental.mounterMode "daemonset") -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: s3-csi-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: s3-csi-controller
+    {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app: s3-csi-controller
+  endpoints:
+    - port: metrics
+      {{- with .Values.metrics.serviceMonitor.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+{{- end }}

@@ -135,6 +135,21 @@ eksPodIdentityAgent:
 # TODO: Remove this in v3 as systemd mount support will be discontinued
 supportLegacySystemDMounts: true
 
+metrics:
+  # Expose Prometheus /metrics endpoints
+  enabled: true
+  controller:
+    port: 8080
+  # Not yet implemented — reserved for future mounter daemonset metrics (P0-B)
+  mounter:
+    port: 9090
+  serviceMonitor:
+    # Requires prometheus-operator CRDs (e.g. kube-prometheus-stack)
+    enabled: false
+    labels: {}
+    interval: ""
+    scrapeTimeout: ""
+
 experimental:
   # Enables support for `s3.csi.aws.com/reserve-headroom-for-mppod` scheduling gate on the Workload Pods.
   # See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/HEADROOM_FOR_MPPOD.md for more details.

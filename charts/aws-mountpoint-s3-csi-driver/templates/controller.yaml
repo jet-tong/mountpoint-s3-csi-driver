@@ -58,6 +58,12 @@ spec:
               role: {{ .role }}
               level: {{ .level }}
             {{- end }}
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.controller.port }}
+              protocol: TCP
+          {{- end }}
           # TODO: Healthcheck for the controller.
           {{- with .Values.controller.resources }}
           resources:

@@ -1,0 +1,19 @@
+{{- if and .Values.metrics.enabled (ne .Values.experimental.mounterMode "daemonset") -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-csi-controller-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: s3-csi-controller
+    {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: s3-csi-controller
+    {{- include "aws-mountpoint-s3-csi-driver.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.controller.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
