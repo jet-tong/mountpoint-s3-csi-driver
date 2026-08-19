@@ -50,6 +50,7 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/version"
 	mpmounter "github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/podmounter/mppod/watcher"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 const (
@@ -61,9 +62,12 @@ const (
 )
 
 var (
-	mountpointPodNamespace = os.Getenv("MOUNTPOINT_NAMESPACE")
-	podWatcherResyncPeriod = time.Minute
-	scheme                 = runtime.NewScheme()
+	mountpointPodNamespace   = os.Getenv("MOUNTPOINT_NAMESPACE")
+	mounterMode              = os.Getenv("MOUNTER_MODE")
+	mounterModeDaemonset     = "daemonset"
+	maxVolumesPerNodeEnvName = "MAX_VOLUMES_PER_NODE"
+	podWatcherResyncPeriod   = time.Minute
+	scheme                   = runtime.NewScheme()
 )
 
 func init() {
@@ -117,28 +121,64 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 
 	stopCh := make(chan struct{})
 
-	mpMounter := mpmounter.New()
-	podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
-	err = podWatcher.Start(stopCh)
-	if err != nil {
-		klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+	var nodeServer *node.S3NodeServer
+
+	if mounterMode == mounterModeDaemonset {
+		klog.Info("Using daemonset mounter mode")
+		klog.Info("Note: s3-csi-daemonset-mounter uses OnDelete update strategy - helm upgrade will not restart/upgrade mounter pods automatically")
+
+		dm := mounter.NewDaemonsetMounter(clientset, nodeID, mpmounter.New(), credProvider, nil, nil, nil)
+
+		// Rebuild mount map from persisted .meta.json files + kernel mount table.
+		// Fatal on failure: operating with an empty map while FUSE mounts exist
+		// would cause duplicate mounts or incorrect unmounts.
+		if err := dm.RebuildMountMap(); err != nil {
+			klog.Fatalf("Failed to rebuild mount map from disk: %v", err)
+		}
+
+		if err := dm.DiscoverCommDir(context.Background()); err != nil {
+			klog.Fatalf("Failed to discover mounter pod: %v", err)
+		}
+		go dm.StartCommDirWatch(stopCh)
+
+		maxVolumesPerNode, err := util.GetEnvAsInt(maxVolumesPerNodeEnvName)
+		if err != nil {
+			return nil, err
+		}
+		if maxVolumesPerNode < 0 {
+			return nil, fmt.Errorf("%s must be >= 0, got %d", maxVolumesPerNodeEnvName, maxVolumesPerNode)
+		}
+		if maxVolumesPerNode == 0 {
+			klog.Warningf("%s is 0: volume limit is disabled (unbounded). The scheduler will not "+
+				"limit the number of S3 volumes per node, which may lead to resource exhaustion "+
+				"(memory OOM, or disk exhaustion when cache is enabled) on s3-csi-daemonset-mounter.",
+				maxVolumesPerNodeEnvName)
+		}
+
+		nodeServer = node.NewS3NodeServer(nodeID, dm, int64(maxVolumesPerNode))
+	} else {
+		mpMounter := mpmounter.New()
+		podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
+		err = podWatcher.Start(stopCh)
+		if err != nil {
+			klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+		}
+
+		s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
+
+		unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
+
+		podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
+
+		go unmounter.StartPeriodicCleanup(stopCh)
+
+		podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
+			kubernetesVersion, nodeID, variant)
+		if err != nil {
+			klog.Fatalln(err)
+		}
+		nodeServer = node.NewS3NodeServer(nodeID, podMounter, 0) // maxVolumesPerNode = 0 means no limit
 	}
-
-	s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
-
-	unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
-
-	podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
-
-	go unmounter.StartPeriodicCleanup(stopCh)
-
-	podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
-		kubernetesVersion, nodeID, variant)
-	if err != nil {
-		klog.Fatalln(err)
-	}
-
-	nodeServer := node.NewS3NodeServer(nodeID, podMounter)
 
 	return &Driver{
 		Endpoint:   endpoint,

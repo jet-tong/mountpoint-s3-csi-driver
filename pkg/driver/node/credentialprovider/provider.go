@@ -29,6 +29,11 @@ const CredentialFilePerm = fs.FileMode(0640)
 // Group access is needed as Mountpoint Pod is run as non-root user
 const CredentialDirPerm = fs.FileMode(0750)
 
+const (
+	webIdentityServiceAccountTokenName    = "token"
+	eksPodIdentityServiceAccountTokenName = "eks-pod-identity-token"
+)
+
 // An AuthenticationSource represents the source (i.e., driver-level or pod-level) where the credentials was obtained.
 type AuthenticationSource = string
 
@@ -49,6 +54,8 @@ const (
 	MountKindPod MountKind = "pod"
 	// MountKindSystemd indicates the mount is managed by systemd
 	MountKindSystemd MountKind = "systemd"
+	// MountKindDaemonset indicates the mount is managed by DaemonsetMounter
+	MountKindDaemonset MountKind = "daemonset"
 )
 
 // A Provider provides methods for accessing AWS credentials.
@@ -85,7 +92,7 @@ type ProvideContext struct {
 	MountpointPodID string
 	VolumeID        string
 
-	// MountKind indicates whether the mount is managed by systemd or pod mounter
+	// MountKind indicates whether the mount is managed by systemd, pod mounter or daemonset mounter
 	MountKind MountKind
 
 	// The following values are provided from CSI volume context.
@@ -136,6 +143,16 @@ func (ctx *ProvideContext) IsPodMountpoint() bool {
 	return ctx.MountKind == MountKindPod
 }
 
+// ToCleanupCtx constructs CleanupContext from ProvideContext.
+func (ctx *ProvideContext) ToCleanupCtx() CleanupContext {
+	return CleanupContext{
+		WritePath: ctx.WritePath,
+		PodID:     ctx.GetCredentialPodID(),
+		VolumeID:  ctx.VolumeID,
+		MountKind: ctx.MountKind,
+	}
+}
+
 // GetCredentialPodID returns the appropriate Pod ID for credential operations.
 // When MountpointPodID is not empty string it returns MountpointPodID (for pod mounter mounts),
 // otherwise returns workload Pod ID (for systemd mounts).
@@ -153,11 +170,11 @@ type CleanupContext struct {
 	PodID     string
 	VolumeID  string
 
-	// MountKind indicates whether the mount is managed by systemd or pod mounter
+	// MountKind indicates whether the mount is managed by systemd, pod mounter or daemonset mounter
 	MountKind MountKind
 }
 
-// SetAsSystemDMountpoint marks this context as managed by systemd instead of pod mounter.
+// SetAsSystemDMountpoint marks this context as managed by systemd instead of pod mounter or daemonset mounter.
 func (ctx *CleanupContext) SetAsSystemDMountpoint() {
 	ctx.MountKind = MountKindSystemd
 }

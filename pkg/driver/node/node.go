@@ -63,12 +63,13 @@ const (
 
 // S3NodeServer is the implementation of the csi.NodeServer interface
 type S3NodeServer struct {
-	NodeID  string
-	Mounter mounter.Mounter
+	NodeID            string
+	Mounter           mounter.Mounter
+	MaxVolumesPerNode int64
 }
 
-func NewS3NodeServer(nodeID string, mounter mounter.Mounter) *S3NodeServer {
-	return &S3NodeServer{NodeID: nodeID, Mounter: mounter}
+func NewS3NodeServer(nodeID string, mounter mounter.Mounter, maxVolumesPerNode int64) *S3NodeServer {
+	return &S3NodeServer{NodeID: nodeID, Mounter: mounter, MaxVolumesPerNode: maxVolumesPerNode}
 }
 
 func (ns *S3NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
@@ -244,8 +245,13 @@ func (ns *S3NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		return nil, status.Errorf(codes.Internal, "Could not unmount %q: %v", targetContainer, err)
 	}
 	if !mounted {
-		klog.V(4).Infof("NodeUnpublishVolume: target path %s not mounted, skipping unmount", targetContainer)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+		// For daemonset mounter, always call Unmount for bookkeeping (MountMap refcount).
+		// For other mounters, skip if not mounted (original behavior).
+		if _, isDaemonset := ns.Mounter.(*mounter.DaemonsetMounter); !isDaemonset {
+			klog.V(4).Infof("NodeUnpublishVolume: target path %s not mounted, skipping unmount", targetContainer)
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+		klog.V(4).Infof("NodeUnpublishVolume: target path %s not mounted, calling Unmount for bookkeeping", targetContainer)
 	}
 
 	credentialCtx := credentialCleanupContextFromUnpublishRequest(req)
@@ -287,7 +293,8 @@ func (ns *S3NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReq
 	klog.V(4).Infof("NodeGetInfo: called with args %+v", req)
 
 	return &csi.NodeGetInfoResponse{
-		NodeId: ns.NodeID,
+		NodeId:            ns.NodeID,
+		MaxVolumesPerNode: ns.MaxVolumesPerNode,
 	}, nil
 }
 

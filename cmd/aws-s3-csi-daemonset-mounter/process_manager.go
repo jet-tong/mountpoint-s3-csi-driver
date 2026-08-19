@@ -60,10 +60,6 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	cmd := exec.Command(mountpointPath, cmdArgs...)
 	cmd.ExtraFiles = []*os.File{fuseDev}
 
-	// TODO: we might need to make the child to inherit credentials ENV from this process (for driver-level creds)
-	// e.g. AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE,
-	//      AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
-
 	cmd.Env = options.Env
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
 	cmd.Stderr = newPrefixWriter(os.Stderr, mountId)
@@ -102,6 +98,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 		if exitCode != 0 {
 			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+			// TODO(vlaad): write error file atomically (open,write,rename)
 			if writeErr := os.WriteFile(errPath, stderr, errorFilePerm); writeErr != nil {
 				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
 			}
