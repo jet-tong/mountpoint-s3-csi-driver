@@ -362,6 +362,44 @@ func waitForKubernetesObjectToDisappear[T any](ctx context.Context, get framewor
 	})).WithTimeout(timeout).WithPolling(interval).Should(gomega.BeNil())
 }
 
+// countMountpointPods returns the number of Mountpoint Pods currently in the Mountpoint namespace.
+// Headroom Pods (name prefix "hr-") are excluded — they are not Mountpoint Pods.
+func countMountpointPods(ctx context.Context, cs clientset.Interface) (int, []string, error) {
+	pods, err := cs.CoreV1().Pods(mountpointNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to list pods in %s namespace: %w", mountpointNamespace, err)
+	}
+	var names []string
+	for i := range pods.Items {
+		if strings.HasPrefix(pods.Items[i].Name, "hr-") {
+			continue
+		}
+		names = append(names, pods.Items[i].Name)
+	}
+	return len(names), names, nil
+}
+
+// waitForMountpointPodsDeleted waits until the number of Mountpoint Pods in the Mountpoint namespace
+// drops to expectedRemaining, or fails after timeout. Use this after terminating workloads to assert
+// that their corresponding Mountpoint Pods actually drain out (annotated needs-unmount -> unmounted ->
+// Succeeded -> deleted). Drain in daemonset mode is periodic (cleanup interval + staleness threshold),
+// so the timeout must be generous.
+func waitForMountpointPodsDeleted(ctx context.Context, f *framework.Framework, expectedRemaining int, timeout time.Duration) {
+	framework.Logf("Waiting for Mountpoint Pods in %s to drain down to %d (timeout %s)...", mountpointNamespace, expectedRemaining, timeout)
+	gomega.Eventually(ctx, func(ctx context.Context) (int, error) {
+		count, names, err := countMountpointPods(ctx, f.ClientSet)
+		if err != nil {
+			return -1, err
+		}
+		if count != expectedRemaining {
+			framework.Logf("Still waiting: %d Mountpoint Pod(s) present (want %d): %v", count, expectedRemaining, names)
+		}
+		return count, nil
+	}).WithTimeout(timeout).WithPolling(15*time.Second).Should(gomega.Equal(expectedRemaining),
+		"Mountpoint Pods for terminated workloads were not deleted in time")
+	framework.Logf("Mountpoint Pods drained down to %d as expected", expectedRemaining)
+}
+
 // findMountpointPods locates all Mountpoint pods for a specific volume on a node
 func findMountpointPods(ctx context.Context, cs clientset.Interface, volumeName string) ([]*v1.Pod, error) {
 	pods, err := cs.CoreV1().Pods(mountpointNamespace).List(ctx, metav1.ListOptions{})
@@ -382,4 +420,70 @@ func findMountpointPods(ctx context.Context, cs clientset.Interface, volumeName 
 	}
 
 	return matchingPods, nil
+}
+
+// isDaemonsetMounterMode returns true if the cluster has daemonset mounter pods running,
+// indicating the driver is deployed in daemonset architecture mode.
+func isDaemonsetMounterMode(ctx context.Context, f *framework.Framework) bool {
+	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=s3-csi-daemonset-mounter",
+	})
+	if err != nil {
+		return false
+	}
+	return len(pods.Items) > 0
+}
+
+// checkReadFromPathSucceedEventually retries reading from a path in a pod, tolerating
+// transient errors
+func checkReadFromPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	sum := sha256.Sum256(genBinDataFromSeed(toWrite, seed))
+	cmd := fmt.Sprintf("dd if=%s bs=%d count=1 | sha256sum | grep -Fq %x", path, toWrite, sum)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkWriteToPathSucceedEventually retries writing to a path in a pod, tolerating
+// transient errors
+func checkWriteToPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd conv=fsync of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathSucceedEventually retries listing a path in a pod, tolerating
+// transient errors
+func checkListingPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathWithEntriesEventually retries listing a path and verifying its entries,
+// tolerating transient errors
+func checkListingPathWithEntriesEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, entries []string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) ([]string, error) {
+		stdout, stderr, err := e2epod.ExecShellInPodWithFullOutput(ctx, f, pod.Name, cmd)
+		if err != nil {
+			return nil, fmt.Errorf("%q failed: %v\nstdout: %s\nstderr: %s", cmd, err, stdout, stderr)
+		}
+		return strings.Fields(stdout), nil
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Equal(entries))
+}
+
+// checkWriteToPathFailsEventually retries verifying that a write to a path fails with exit code 1,
+// tolerating transient errors
+func checkWriteToPathFailsEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodFail(ctx, f, pod, cmd, 1)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
 }

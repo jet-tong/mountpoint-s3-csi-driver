@@ -57,12 +57,11 @@ func DetectVariant(client *rest.Config, log logr.Logger) Variant {
 // InstallationMethod returns the installation method for the CSI driver.
 // It reads the INSTALLATION_TYPE environment variable and returns its value,
 // falling back to "unknown" if the variable is not set.
-// Known values: eks-addon, helm, helm-dev, kustomize.
-// (Note helm-dev is installation method for development purposes only, set by unsupportedDevInstall flag)
+// Known values: eks-addon, helm, kustomize.
 func InstallationMethod() string {
 	method := strings.ToLower(strings.TrimSpace(os.Getenv("INSTALLATION_TYPE")))
 	switch method {
-	case "eks-addon", "helm", "helm-dev", "kustomize":
+	case "eks-addon", "helm", "kustomize":
 		return method
 	}
 

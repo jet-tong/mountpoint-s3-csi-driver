@@ -36,19 +36,6 @@ function helm_uninstall_driver() {
   else
     echo "driver does not seem to be installed"
   fi
-  # Clean up the mount-s3 namespace before reinstalling. A previous run may
-  # have left Mountpoint pods in mount-s3 that are still running, and
-  # Kubernetes rejects new resource creation in a namespace that is being terminated.
-  if $KUBECTL_BIN get namespace mount-s3 --kubeconfig $KUBECONFIG &>/dev/null; then
-    echo "Deleting leftover mount-s3 namespace..."
-    # Mountpoint pods ignore SIGTERM and have a 10-minute termination grace period - bypass it.
-    $KUBECTL_BIN delete pods --all --namespace mount-s3 --grace-period=0 --force --ignore-not-found --kubeconfig $KUBECONFIG || true
-    $KUBECTL_BIN delete namespace mount-s3 --kubeconfig $KUBECONFIG --ignore-not-found
-    if ! $KUBECTL_BIN wait --for=delete namespace/mount-s3 --timeout=120s --kubeconfig $KUBECONFIG; then
-      echo "WARNING: mount-s3 namespace did not finish terminating within 120s"
-      $KUBECTL_BIN get namespace mount-s3 -o yaml --kubeconfig $KUBECONFIG || true
-    fi
-  fi
   $KUBECTL_BIN get pods -A --kubeconfig $KUBECONFIG
   $KUBECTL_BIN get CSIDriver --kubeconfig $KUBECONFIG
 }
@@ -80,15 +67,15 @@ function helm_install_driver() {
 
   $HELM_BIN upgrade --install $RELEASE_NAME --namespace kube-system ./charts/aws-mountpoint-s3-csi-driver --values \
     ./charts/aws-mountpoint-s3-csi-driver/values.yaml \
-    --set unsupportedDevInstall=true \
     --set image.repository=${REPOSITORY} \
     --set image.tag=${TAG} \
     --set image.pullPolicy=Always \
     --set node.serviceAccount.create=true \
-    --set experimental.reserveHeadroomForMountpointPods=true \
     ${IRSA_FLAG} \
     --kubeconfig ${KUBECONFIG}
   $KUBECTL_BIN rollout status daemonset s3-csi-node -n kube-system --timeout=60s --kubeconfig $KUBECONFIG
+  # Wait for pod readiness (rollout status doesn't support OnDelete strategy)
+  $KUBECTL_BIN wait --for=condition=Ready pods -l app=s3-csi-daemonset-mounter -n kube-system --timeout=60s --kubeconfig $KUBECONFIG
   $KUBECTL_BIN get pods -A --kubeconfig $KUBECONFIG
   echo "s3-csi-node-image: $($KUBECTL_BIN get daemonset s3-csi-node -n kube-system -o jsonpath="{$.spec.template.spec.containers[:1].image}" --kubeconfig $KUBECONFIG)"
 

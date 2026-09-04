@@ -1,13 +1,3 @@
-{{- if and (not .Values.isHelmRepo) (not .Values.isEKSAddon) (not .Values.unsupportedDevInstall) -}}
-{{- fail `
-
-ERROR: This Helm chart cannot be installed directly from GitHub main branch, as it may reference unreleased images.
-
-Please migrate to a supported installation method described in https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/INSTALL.md.
-For (unsupported) development installation, please set the 'unsupportedDevInstall' value to 'true'.
-See https://github.com/awslabs/mountpoint-s3-csi-driver/issues/859 for more details.
-` -}}
-{{- end -}}
 kind: DaemonSet
 apiVersion: apps/v1
 metadata:
@@ -108,12 +98,29 @@ spec:
               value: {{ .Values.node.kubeletPath }}
             - name: SUPPORT_LEGACY_SYSTEMD_MOUNTS
               value: "{{ .Values.supportLegacySystemDMounts }}"
+            - name: SUPPORT_LEGACY_POD_MOUNTS
+              value: "{{ .Values.supportLegacyPodMounts }}"
             - name: MOUNTPOINT_NAMESPACE
               value: {{ .Values.mountpointPod.namespace }}
             - name: EKS_POD_IDENTITY_AGENT_CONTAINER_CREDENTIALS_FULL_URI
               value: {{ .Values.eksPodIdentityAgent.containerCredentialsFullURI }}
             - name: INSTALLATION_TYPE
-              value: {{ if .Values.isEKSAddon }}eks-addon{{ else if .Values.isHelmRepo }}helm{{ else }}helm-dev{{ end }}
+              value: {{ if .Values.isEKSAddon }}eks-addon{{ else }}helm{{ end }}
+            {{- if eq .Values.experimental.mounterMode "daemonset" }}
+            {{- if ne (len .Values.daemonsetMounters) 1 }}
+            {{- fail "daemonsetMounters must have exactly one entry" }}
+            {{- end }}
+            {{- $mounter := index .Values.daemonsetMounters 0 }}
+            {{- if lt (int $mounter.maxVolumesPerNode) 0 }}
+            {{- fail "daemonsetMounters[].maxVolumesPerNode must be >= 0" }}
+            {{- end }}
+            - name: MOUNTER_MODE
+              value: daemonset
+            - name: MOUNTER_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: MAX_VOLUMES_PER_NODE
+              value: "{{ $mounter.maxVolumesPerNode }}"
+            {{- end }}
             {{- with .Values.awsAccessSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
