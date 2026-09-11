@@ -108,12 +108,34 @@ spec:
               value: {{ .Values.node.kubeletPath }}
             - name: SUPPORT_LEGACY_SYSTEMD_MOUNTS
               value: "{{ .Values.supportLegacySystemDMounts }}"
+            {{- if eq .Values.experimental.mounterMode "daemonset" }}
+            # SUPPORT_LEGACY_POD_MOUNTS only affects the daemonset (V3) code path (draining/refreshing
+            # existing V2 pod mounts during a V2 -> V3 upgrade). It is never read in pod mode, so we
+            # only emit it in daemonset mode.
+            - name: SUPPORT_LEGACY_POD_MOUNTS
+              value: "{{ .Values.supportLegacyPodMounts }}"
+            {{- end }}
             - name: MOUNTPOINT_NAMESPACE
               value: {{ .Values.mountpointPod.namespace }}
             - name: EKS_POD_IDENTITY_AGENT_CONTAINER_CREDENTIALS_FULL_URI
               value: {{ .Values.eksPodIdentityAgent.containerCredentialsFullURI }}
             - name: INSTALLATION_TYPE
               value: {{ if .Values.isEKSAddon }}eks-addon{{ else if .Values.isHelmRepo }}helm{{ else }}helm-dev{{ end }}
+            {{- if eq .Values.experimental.mounterMode "daemonset" }}
+            {{- if ne (len .Values.daemonsetMounters) 1 }}
+            {{- fail "daemonsetMounters must have exactly one entry" }}
+            {{- end }}
+            {{- $mounter := index .Values.daemonsetMounters 0 }}
+            {{- if lt (int $mounter.maxVolumesPerNode) 0 }}
+            {{- fail "daemonsetMounters[].maxVolumesPerNode must be >= 0" }}
+            {{- end }}
+            - name: MOUNTER_MODE
+              value: daemonset
+            - name: MOUNTER_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: MAX_VOLUMES_PER_NODE
+              value: "{{ $mounter.maxVolumesPerNode }}"
+            {{- end }}
             {{- with .Values.awsAccessSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
