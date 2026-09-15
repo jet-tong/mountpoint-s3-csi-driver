@@ -4,6 +4,8 @@ package mounter
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 
 	"k8s.io/klog/v2"
 	mountutils "k8s.io/mount-utils"
@@ -119,6 +121,67 @@ func (m *Mounter) FindReferencesToMountpoint(target Target) ([]string, error) {
 	return m.mount.GetMountRefs(target)
 }
 
+// IsMountPoint checks whether `target` is any mount point (not necessarily Mountpoint).
+// Uses the kernel mount table via mount-utils.
+func (m *Mounter) IsMountPoint(target Target) (bool, error) {
+	return m.mount.IsMountPoint(target)
+}
+
+// IsHealthyMountpoint reports whether `target` is a live Mountpoint mount.
+//
+// It returns a three-way result so callers can distinguish "definitely dead"
+// from "couldn't determine", and avoid tearing down a possibly-live source on a
+// transient error:
+//   - (true, nil):  healthy.
+//   - (false, nil): definitely dead — not a Mountpoint mount, corrupted mount,
+//     or the FUSE daemon returned ENOTCONN.
+//   - (false, err): UNKNOWN — a transient error (e.g. failure reading the mount
+//     table, EINTR, fd exhaustion) prevented a determination. Callers MUST NOT
+//     treat this as dead; they should retry later.
+//
+// A dead FUSE mount (after mounter pod crash) stays in the mount table but returns ENOTCONN on any I/O.
+func (m *Mounter) IsHealthyMountpoint(target Target) (bool, error) {
+	isMounted, err := m.CheckMountpoint(target)
+	if err != nil {
+		// A missing target directory means there is no mount there at all.
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, ErrMountAbsent
+		}
+		// A corrupted mount is a definite "dead" signal.
+		if m.IsMountpointCorrupted(err) {
+			return false, nil
+		}
+		// Anything else (e.g. couldn't stat or list the mount table) is UNKNOWN.
+		return false, fmt.Errorf("cannot determine mount health for %q: %w", target, err)
+	}
+	if !isMounted {
+		// Not our mount (or not a mount at all).
+		return false, ErrMountAbsent
+	}
+
+	// Mount entry exists in the table — verify the FUSE daemon is alive.
+	// Opening the root directory issues a FUSE OPENDIR to the daemon. Mountpoint does NOT
+	// set FUSE_NO_OPENDIR_SUPPORT, so the kernel always forwards opendir to userspace.
+	// A dead mount returns ENOTCONN; a live daemon succeeds without requiring S3 connectivity.
+	// We intentionally avoid Readdirnames which would trigger a ListObjectsV2 call to S3,
+	// causing false negatives during transient network issues.
+	f, err := os.Open(target)
+	if err != nil {
+		// A vanished target (ENOENT) — path went away between the checks.
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, ErrMountAbsent
+		}
+		// A corrupted/dead mount (ENOTCONN, ESTALE, EIO, ...) — definite dead.
+		if m.IsMountpointCorrupted(err) {
+			return false, nil
+		}
+		// Transient errors (EINTR, EMFILE/ENFILE, ENOMEM, ...) are UNKNOWN, not dead.
+		return false, fmt.Errorf("cannot open %q to probe FUSE liveness: %w", target, err)
+	}
+	f.Close()
+	return true, nil
+}
+
 // IsMountpointCorrupted returns whether an error returned from [Mounter.CheckMountpoint]
 // indicates the queried mount point is corrupted or not.
 //
@@ -126,3 +189,9 @@ func (m *Mounter) FindReferencesToMountpoint(target Target) ([]string, error) {
 func (m *Mounter) IsMountpointCorrupted(err error) bool {
 	return mountutils.IsCorruptedMnt(err)
 }
+
+// ErrMountAbsent indicates that the path does not exist or is not a Mountpoint mount.
+// Returned by IsHealthyMountpoint so callers that need to distinguish "absent/fresh"
+// from "dead/corrupted" can do so. Source callers fold this into (false, nil) = dead;
+// target callers treat it as "proceed with fresh mount".
+var ErrMountAbsent = errors.New("mounter: mount path does not exist or is not a Mountpoint mount")

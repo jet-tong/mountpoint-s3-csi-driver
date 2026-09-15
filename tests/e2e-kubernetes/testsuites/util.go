@@ -55,33 +55,43 @@ func genBinDataFromSeed(len int, seed int64) []byte {
 	return binData
 }
 
-func checkWriteToPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) error {
+func checkExecInPodSucceed(ctx context.Context, f *framework.Framework, pod *v1.Pod, cmd string) {
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "exec in pod %s/%s failed for cmd %q: %v", pod.Namespace, pod.Name, cmd, err)
+}
+
+func checkWriteToPathSucceed(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
 	data := genBinDataFromSeed(toWrite, seed)
 	encoded := base64.StdEncoding.EncodeToString(data)
-	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | dd conv=fsync of=%s bs=%d count=1", encoded, path, toWrite))
-	if err != nil {
-		framework.Logf("written data with sha: %x", sha256.Sum256(data))
-	}
-	return err
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd conv=fsync of=%s bs=%d count=1", encoded, path, toWrite)
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "write to path %q in pod %s/%s failed: %v", path, pod.Namespace, pod.Name, err)
 }
 
 func checkWriteToPathFails(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
 	data := genBinDataFromSeed(toWrite, seed)
 	encoded := base64.StdEncoding.EncodeToString(data)
-	e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | dd of=%s bs=%d count=1", encoded, path, toWrite), 1)
+	err := e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | dd of=%s bs=%d count=1", encoded, path, toWrite), 1)
+	framework.ExpectNoError(err, "write to path %q in pod %s/%s expected to fail with a specific exit code: %v", path, pod.Namespace, pod.Name, err)
 }
 
-func checkReadFromPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) error {
+func checkReadFromPathSucceed(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
 	sum := sha256.Sum256(genBinDataFromSeed(toWrite, seed))
-	return e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("dd if=%s bs=%d count=1 | sha256sum | grep -Fq %x", path, toWrite, sum))
+	cmd := fmt.Sprintf("dd if=%s bs=%d count=1 | sha256sum | grep -Fq %x", path, toWrite, sum)
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "read from path %q in pod %s/%s failed (expected sha256 %x, size %d): %v", path, pod.Namespace, pod.Name, sum, toWrite, err)
 }
 
-func checkDeletingPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
-	e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("rm %s", path))
+func checkDeletingPathSucceed(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
+	cmd := fmt.Sprintf("rm %s", path)
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "delete path %q in pod %s/%s failed: %v", path, pod.Namespace, pod.Name, err)
 }
 
-func checkListingPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
-	e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("ls %s", path))
+func checkListingPathSucceed(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "list path %q in pod %s/%s failed: %v", path, pod.Namespace, pod.Name, err)
 }
 
 func checkListingPathWithEntries(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, entries []string) {
@@ -232,9 +242,11 @@ func podModifierNonRoot(pod *v1.Pod) {
 
 func copySmallFileToPod(ctx context.Context, f *framework.Framework, pod *v1.Pod, hostPath, podPath string) {
 	data, err := os.ReadFile(hostPath)
-	framework.ExpectNoError(err)
+	framework.ExpectNoError(err, "read host file %q failed: %v", hostPath, err)
 	encoded := base64.StdEncoding.EncodeToString(data)
-	e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d > %s", encoded, podPath))
+	cmd := fmt.Sprintf("echo %s | base64 -d > %s", encoded, podPath)
+	err = e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	framework.ExpectNoError(err, "copy file to path %q in pod %s/%s failed: %v", podPath, pod.Namespace, pod.Name, err)
 }
 
 // In some cases like changing Secret object, it's useful to trigger recreation of our pods.
@@ -370,4 +382,70 @@ func findMountpointPods(ctx context.Context, cs clientset.Interface, volumeName 
 	}
 
 	return matchingPods, nil
+}
+
+// isDaemonsetMounterMode returns true if the cluster has daemonset mounter pods running,
+// indicating the driver is deployed in daemonset architecture mode.
+func isDaemonsetMounterMode(ctx context.Context, f *framework.Framework) bool {
+	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=s3-csi-daemonset-mounter",
+	})
+	if err != nil {
+		return false
+	}
+	return len(pods.Items) > 0
+}
+
+// checkReadFromPathSucceedEventually retries reading from a path in a pod, tolerating
+// transient errors
+func checkReadFromPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	sum := sha256.Sum256(genBinDataFromSeed(toWrite, seed))
+	cmd := fmt.Sprintf("dd if=%s bs=%d count=1 | sha256sum | grep -Fq %x", path, toWrite, sum)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkWriteToPathSucceedEventually retries writing to a path in a pod, tolerating
+// transient errors
+func checkWriteToPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd conv=fsync of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathSucceedEventually retries listing a path in a pod, tolerating
+// transient errors
+func checkListingPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathWithEntriesEventually retries listing a path and verifying its entries,
+// tolerating transient errors
+func checkListingPathWithEntriesEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, entries []string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) ([]string, error) {
+		stdout, stderr, err := e2epod.ExecShellInPodWithFullOutput(ctx, f, pod.Name, cmd)
+		if err != nil {
+			return nil, fmt.Errorf("%q failed: %v\nstdout: %s\nstderr: %s", cmd, err, stdout, stderr)
+		}
+		return strings.Fields(stdout), nil
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Equal(entries))
+}
+
+// checkWriteToPathFailsEventually retries verifying that a write to a path fails with exit code 1,
+// tolerating transient errors
+func checkWriteToPathFailsEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodFail(ctx, f, pod, cmd, 1)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
 }

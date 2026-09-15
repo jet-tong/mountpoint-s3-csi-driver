@@ -1,6 +1,12 @@
 # Default values for Mountpoint for Amazon S3 CSI Driver Helm chart.
 # You can customize any values here during installation.
 
+# Automatically set to true when the chart is published to the official Helm repository.
+# Installing directly from a GitHub branch is not supported.
+# Use the Helm repository (https://awslabs.github.io/mountpoint-s3-csi-driver) or EKS Addon instead.
+# See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/INSTALL.md for details.
+isHelmRepo: false
+
 # Set to true if running on OpenShift/ROSA.
 # If not set, auto-detects OpenShift where possible.
 isOpenShift: null
@@ -12,7 +18,7 @@ image:
   repository: public.ecr.aws/mountpoint-s3-csi-driver/aws-mountpoint-s3-csi-driver
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "v2.6.0"
+  tag: "v2.8.0"
 
 node:
   kubeletPath: /var/lib/kubelet
@@ -57,7 +63,7 @@ sidecars:
   nodeDriverRegistrar:
     image:
       repository: public.ecr.aws/csi-components/csi-node-driver-registrar
-      tag: v2.17.0-eksbuild.2
+      tag: v2.17.0-eksbuild.5
       pullPolicy: IfNotPresent
     env:
       - name: KUBE_NODE_NAME
@@ -73,7 +79,7 @@ sidecars:
   livenessProbe:
     image:
       repository: public.ecr.aws/csi-components/livenessprobe
-      tag: v2.19.0-eksbuild.2
+      tag: v2.19.0-eksbuild.5
       pullPolicy: IfNotPresent
     volumeMounts:
       - mountPath: /csi
@@ -93,6 +99,8 @@ controller:
     name: s3-csi-driver-controller-sa
 
 mountpointPod:
+  # NOTE: `namespace` is still required in daemonset (V3) mode — the drain-only controller uses it to
+  # identify leftover V2 Mountpoint/Headroom Pods to clean up.
   namespace: mount-s3
   # If creating the namespace yourself, review the namespace definition in this Helm chart to follow the best practices.
   # For example, this chart enforces that pods in the namespace are bound by the 'restricted' pod security standard.
@@ -122,12 +130,16 @@ awsAccessSecret:
 eksPodIdentityAgent:
   containerCredentialsFullURI: "http://169.254.170.23/v1/credentials"
 
-# CSI Driver v2 only: If enabled, the driver will continue supporting S3 volumes that were mounted by v1 (SystemD mounts),
+# If enabled, the driver will continue supporting S3 volumes that were mounted by v1 (SystemD mounts),
 # including credential refresh, cleanup, and unmounting these legacy volumes.
 # You can set this feature to false for fresh clusters with no v1 volumes,
 # or if you've migrated all workloads using S3 volumes after upgrading to v2.
-# TODO: Remove this in v3 as systemd mount support will be discontinued
 supportLegacySystemDMounts: true
+
+# Set to true to enable credential refresh for legacy V2 (pod-mounter) mounts
+# after upgrading to V3 (daemonset mounter). This ensures V2 Mountpoint Pods
+# receive refreshed credentials during the transition period.
+supportLegacyPodMounts: true
 
 experimental:
   # Enables support for `s3.csi.aws.com/reserve-headroom-for-mppod` scheduling gate on the Workload Pods.
@@ -135,3 +147,35 @@ experimental:
   reserveHeadroomForMountpointPods: false
   headroomPodImage: public.ecr.aws/eks-distro/kubernetes/pause:3.10
   headroomPodLabels: {}
+  # WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
+  # In-place updates with daemonset mode may not be supported.
+  # Mounter mode: "pod" (V2 default) or "daemonset" (experimental two-daemonset architecture).
+  # In daemonset mode, one mounter daemonset pod handles all mountpoint processes instead of 
+  # one mountpoint pod per workload in pod mode.
+  mounterMode: "daemonset"
+
+# WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
+# Configuration for the secondary mounter daemonset(s).
+# Only used when experimental.mounterMode is "daemonset".
+daemonsetMounters:
+    # Maximum number of distinct S3 volumes (Mountpoint processes) per node.
+    # Advertised to the Kubernetes scheduler via MaxVolumesPerNode.
+    # Set to 0 to disable the limit (unbounded); this risks resource exhaustion
+    # (memory OOM, or disk exhaustion with cache) on the mounter DaemonSet pod.
+    # IMPORTANT: volumeHandle must be unique per PV as the scheduler uses it to 
+    # track volume usage.
+  - maxVolumesPerNode: 4
+    # Total resource requests and limits for the mounter DaemonSet pod.
+    # requests.memory should be sized to maxVolumesPerNode × per-mount memory
+    # (e.g., 4 mounts × 512Mi = 2Gi, or 10 mounts × 4Gi = 40Gi).
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+    logLevel: 4
+    podLabels: {}
+    tolerateAllTaints: true
+    defaultTolerations: true
+    tolerations: []
+    affinity: {}
+    imagePullSecrets: []
