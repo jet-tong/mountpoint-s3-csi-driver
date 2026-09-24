@@ -61,15 +61,28 @@ const (
 	filePerm660 = "660" // User: read/write, Group: read/write, Others: none
 )
 
-// S3NodeServer is the implementation of the csi.NodeServer interface
-type S3NodeServer struct {
-	NodeID            string
-	Mounter           mounter.Mounter
-	MaxVolumesPerNode int64
+// Other V2 Per-mount cache attributes that have NO EFFECT in daemonset mode (only warning).
+var otherCacheVolumeAttributes = []string{
+	volumecontext.CacheEmptyDirSizeLimit,
+	volumecontext.CacheEphemeralStorageClassName,
+	volumecontext.CacheEphemeralStorageResourceRequest,
 }
 
-func NewS3NodeServer(nodeID string, mounter mounter.Mounter, maxVolumesPerNode int64) *S3NodeServer {
-	return &S3NodeServer{NodeID: nodeID, Mounter: mounter, MaxVolumesPerNode: maxVolumesPerNode}
+// S3NodeServer is the implementation of the csi.NodeServer interface
+type S3NodeServer struct {
+	NodeID               string
+	Mounter              mounter.Mounter
+	MaxVolumesPerNode    int64
+	DaemonsetMounterMode bool // if true, configures shared cache volume instead of pod mode PV attribute.
+}
+
+func NewS3NodeServer(nodeID string, mounter mounter.Mounter, maxVolumesPerNode int64, daemonsetMounterMode bool) *S3NodeServer {
+	return &S3NodeServer{
+		NodeID:               nodeID,
+		Mounter:              mounter,
+		MaxVolumesPerNode:    maxVolumesPerNode,
+		DaemonsetMounterMode: daemonsetMounterMode,
+	}
 }
 
 func (ns *S3NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
@@ -156,8 +169,21 @@ func (ns *S3NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		args.SetIfAbsent(mountpoint.ArgAllowRoot, mountpoint.ArgNoValue)
 	}
 
-	// If cacheEmptyDirSizeLimit is set with cache=emptyDir, validate that an explicit --max-cache-size (in MiB) doesn't exceed it.
-	if emptyDirSizeLimit := volumeCtx[volumecontext.CacheEmptyDirSizeLimit]; emptyDirSizeLimit != "" && volumeCtx[volumecontext.Cache] == volumecontext.CacheTypeEmptyDir {
+	if ns.DaemonsetMounterMode {
+		// The backing the mounter pod actually has, which is what this mount will get.
+		mounterCacheType := mounter.CacheNone
+		if dm, ok := ns.Mounter.(*mounter.DaemonsetMounter); ok {
+			observed, err := dm.MounterCacheType()
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "volume %s: %v", volumeID, err)
+			}
+			mounterCacheType = observed
+		}
+		if err := configureCacheForDaemonsetMode(&args, volumeCtx, volumeID, mounterCacheType); err != nil {
+			return nil, err
+		}
+	} else if emptyDirSizeLimit := volumeCtx[volumecontext.CacheEmptyDirSizeLimit]; emptyDirSizeLimit != "" && volumeCtx[volumecontext.Cache] == volumecontext.CacheTypeEmptyDir {
+		// Pod Mode: If cacheEmptyDirSizeLimit is set with cache=emptyDir, validate that an explicit --max-cache-size (in MiB) doesn't exceed it.
 		quantity, err := resource.ParseQuantity(emptyDirSizeLimit)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "Invalid %s %q: %v", volumecontext.CacheEmptyDirSizeLimit, emptyDirSizeLimit, err)
@@ -214,6 +240,90 @@ func (ns *S3NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 	klog.V(4).Infof("NodePublishVolume: %s was mounted", targetContainer)
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// configureCacheForDaemonsetMode decides whether this mount caches, and rejects a PV whose requested
+// backing is not the one this node has.
+func configureCacheForDaemonsetMode(args *mountpoint.Args, volumeCtx map[string]string, volumeID string, mounterCacheType mounter.CacheType) error {
+	cacheType := volumeCtx[volumecontext.Cache]
+	cacheEnabledViaOptions := args.Has(mountpoint.ArgCache)
+
+	// Reject if cache configured with both mountOptions / volumeAttributes to match v2.
+	if cacheEnabledViaOptions && cacheType != "" {
+		return status.Error(codes.InvalidArgument,
+			"Cache configured with both `mountOptions` and `volumeAttributes`, please remove the deprecated cache configuration in `mountOptions`")
+	}
+
+	// Mountpoint rejects `--max-cache-size` without `--cache` - strip max-cache-size with warning.
+	if !cacheEnabledViaOptions && cacheType == "" {
+		if _, ok := args.Remove(mountpoint.ArgMaxCacheSize); ok {
+			klog.Warningf("NodePublishVolume: volume %s sets %s but does not enable the cache, ignoring it."+
+				" Set the %q volume attribute to enable the cache.",
+				volumeID, mountpoint.ArgMaxCacheSize, volumecontext.Cache)
+		}
+		return nil
+	}
+
+	if mounterCacheType == mounter.CacheNone {
+		return status.Errorf(codes.InvalidArgument,
+			"Volume %s requests a local cache, but s3-csi-daemonset-mounter has no cache volume."+
+				" Add a daemonsetMounters[0].cache block and restart its pods", volumeID)
+	}
+
+	if cacheEnabledViaOptions {
+		klog.Warningf("NodePublishVolume: volume %s configures the cache via the deprecated `cache`"+
+			" mount option, so it accepts the node's %s cache. Use the %q volume attribute instead,"+
+			" set to the mounter's enabled cache type.",
+			volumeID, mounterCacheType, volumecontext.Cache)
+	} else if err := checkCacheTypeMatches(volumeCtx, volumeID, mounterCacheType); err != nil {
+		return err
+	}
+
+	// Add cache marker but discard customer-supplied path, mounter fills the directory in for cacheEnabledViaOptions case.
+	args.Set(mountpoint.ArgCache, mountpoint.ArgNoValue)
+
+	for _, attr := range otherCacheVolumeAttributes {
+		if volumeCtx[attr] != "" {
+			klog.Warningf("NodePublishVolume: volume %s sets %q, which has no effect in daemonset mode."+
+				" The cache volume is shared by every mount on the node and is configured with the"+
+				" daemonsetMounters[0].cache Helm value. Use %s in mountOptions to limit this mount's cache.",
+				volumeID, attr, mountpoint.ArgMaxCacheSize)
+		}
+	}
+
+	// TODO: For emptyDir disk case, find approach to limit max cache size with/without sizeLimit to prevent
+	// resource exhaustion (e.g. --max-cache-size). Currently Mountpoint stops writing cache once cache filesystem
+	// has less than 5% free, which works correctly for emptyDir:Memory (tmpfs) and ephemeral. But emptyDir disk case
+	// Mountpoint's statvfs reads the node's root filesystem stats instead, so we cannot rely on this check.
+	// Temp: warn user if cache is enabled but no max cache size is set (remove when TODO addressed).
+	if !args.Has(mountpoint.ArgMaxCacheSize) {
+		klog.Warningf("NodePublishVolume: volume %s enables the cache without %s, so it may use the"+
+			" whole cache volume of s3-csi-daemonset-mounter.", volumeID, mountpoint.ArgMaxCacheSize)
+	}
+
+	return nil
+}
+
+// checkCacheTypeMatches rejects a PV whose requested cache backing is not the one this node has.
+func checkCacheTypeMatches(volumeCtx map[string]string, volumeID string, mounterCacheType mounter.CacheType) error {
+	requested, err := mounter.ParseCacheTypeFromPV(volumeCtx[volumecontext.Cache], volumeCtx[volumecontext.CacheEmptyDirMedium])
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument,
+			"Volume %s sets %q: %v. It must also match this node's cache, which is %s",
+			volumeID, volumecontext.Cache, err, mounterCacheType)
+	}
+
+	if requested != mounterCacheType {
+		// Both remediations, since only the operator knows which of the two applies.
+		return status.Errorf(codes.InvalidArgument,
+			"Volume %s requests a %s cache, but s3-csi-daemonset-mounter on this node provides %s."+
+				" Set the volume's %q attribute to match this node, or schedule it onto a node whose"+
+				" cache matches. If you have just changed the daemonsetMounters[0].cache Helm value,"+
+				" the mounter pods are still on the old type because its updateStrategy is OnDelete -"+
+				" replace them with the cordon, drain, delete, uncordon procedure in docs/CACHING.md",
+			volumeID, requested, mounterCacheType, volumecontext.Cache)
+	}
+	return nil
 }
 
 func (ns *S3NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {

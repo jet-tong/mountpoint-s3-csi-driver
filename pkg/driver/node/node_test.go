@@ -30,9 +30,18 @@ type nodeServerTestEnv struct {
 }
 
 func initNodeServerTestEnv(t *testing.T) *nodeServerTestEnv {
+	return initNodeServerTestEnvWithMounterMode(t, false)
+}
+
+func initNodeServerTestEnvWithMounterMode(t *testing.T, daemonsetMounterMode bool) *nodeServerTestEnv {
+	// Disk-backed emptyDir: the backing the daemonset-mode tests here request.
+	return initNodeServerTestEnvWithCache(t, daemonsetMounterMode)
+}
+
+func initNodeServerTestEnvWithCache(t *testing.T, daemonsetMounterMode bool) *nodeServerTestEnv {
 	mockCtl := gomock.NewController(t)
 	mockMounter := mock_driver.NewMockMounter(mockCtl)
-	server := node.NewS3NodeServer(testNodeID, mockMounter, 0)
+	server := node.NewS3NodeServer(testNodeID, mockMounter, 0, daemonsetMounterMode)
 	return &nodeServerTestEnv{
 		mockCtl:     mockCtl,
 		mockMounter: mockMounter,
@@ -708,6 +717,8 @@ func TestNodePublishVolumeForPodMounter(t *testing.T) {
 	}
 }
 
+// TODO: Disable this unit test for daemonset mounter
+// TODO: HugePages Unit Test
 func TestNodePublishVolumeMaxCacheSizeInjection(t *testing.T) {
 	var (
 		volumeId   = "test-volume-id"
@@ -1067,6 +1078,69 @@ func TestNodeGetInfo(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestNodePublishVolumeCacheByMounterMode(t *testing.T) {
+	const (
+		volumeID   = "test-volume-id"
+		bucketName = "test-bucket-name"
+		// A real kubelet target path, with a PV name that differs from the CSI volume ID.
+		pvName     = "test-pv-name"
+		targetPath = "/var/lib/kubelet/pods/pod-uid/volumes/kubernetes.io~csi/" + pvName + "/mount"
+	)
+
+	// A cached volume whose attributes would build a per-mount cache volume in pod mode.
+	volumeContext := map[string]string{
+		volumecontext.BucketName:             bucketName,
+		volumecontext.Cache:                  volumecontext.CacheTypeEmptyDir,
+		volumecontext.CacheEmptyDirSizeLimit: "2Gi",
+	}
+
+	testCases := []struct {
+		name                 string
+		daemonsetMounterMode bool
+		// Pod mode sizes the cache itself; daemonset mode leaves that to the mounter, which owns
+		// the shared cache volume.
+		expectedArgs []string
+	}{
+		{
+			name:         "pod mode injects a cache size from the volume attributes",
+			expectedArgs: []string{"--allow-root", "--max-cache-size=1945"},
+		},
+		{
+			// Valueless: the mounter names the directory, because it is the component that resolves
+			// the mounter pod's cache volume. Note the per-PV sizing attribute is dropped.
+			name:                 "daemonset mode marks the cache and leaves the directory to the mounter",
+			daemonsetMounterMode: true,
+			expectedArgs:         []string{"--allow-root", "--cache"},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			nodeTestEnv := initNodeServerTestEnvWithMounterMode(t, testCase.daemonsetMounterMode)
+			defer nodeTestEnv.mockCtl.Finish()
+
+			var gotArgs mountpoint.Args
+			nodeTestEnv.mockMounter.EXPECT().
+				Mount(gomock.Any(), gomock.Eq(bucketName), gomock.Eq(targetPath), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(_ context.Context, _ string, _ string, _ credentialprovider.ProvideContext, args mountpoint.Args, _ string, _ envprovider.Environment) {
+					gotArgs = args
+				})
+
+			_, err := nodeTestEnv.server.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+				VolumeId: volumeID,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+					AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+				},
+				TargetPath:    targetPath,
+				VolumeContext: volumeContext,
+			})
+			assert.NoError(t, err)
+			assert.Equals(t, testCase.expectedArgs, gotArgs.SortedList())
+		})
 	}
 }
 

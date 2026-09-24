@@ -32,6 +32,9 @@ The CSI Driver mounts the provided cache volume to the Mountpoint Pod and config
 
 See [Mountpoint's documentation](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#local-cache) for more details about local cache.
 
+> [!NOTE]
+> The rest of this section describes the default (pod) mounter mode. In the experimental daemonset mode the cache volume is configured once for the whole node instead of per PV -- see [Local cache in daemonset mode](#local-cache-in-daemonset-mode).
+
 #### `emptyDir`
 
 You can specify `emptyDir` as cache type in your PV to use an `emptyDir` volume as local cache:
@@ -318,6 +321,94 @@ spec:
       bucketName: amzn-s3-demo-bucket
       cache: emptyDir
 ```
+
+#### Local cache in daemonset mode
+
+<!-- TODO Remove warning -->
+> [!WARNING]
+> Daemonset mode is experimental and its configuration may change between releases.
+
+In daemonset mode every Mountpoint process on a node runs in the shared `s3-csi-daemonset-mounter` pod, so there is no per-mount pod to attach a cache volume to. Instead one cache volume is configured for the whole node and each mount is given its own subdirectory of it. Enable it with the `daemonsetMounters[0].cache` Helm value:
+
+```yaml
+daemonsetMounters:
+  - maxVolumesPerNode: 4
+    # Adding this block gives the node a cache volume. Remove it to disable caching.
+    cache:
+      # "emptyDir" (node disk or RAM) or "ephemeral" (dedicated volume from your StorageClass).
+      type: emptyDir
+      emptyDir:
+        medium: ""
+      # type: ephemeral
+      # ephemeral:
+      #   storageClassName: ebs-sc
+      #   size: 100Gi
+```
+
+The `cache.type` values correspond to the per-PV [`emptyDir`](#emptydir) and [`ephemeral`](#ephemeral) types described above, and the same considerations apply when choosing between them.
+
+PVs then opt in without configuring storage, since the volume already exists:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+spec:
+  mountOptions:
+    # Optional: limit how much of the shared cache volume this mount may use.
+    - max-cache-size 10240
+  csi:
+    driver: s3.csi.aws.com
+    volumeAttributes:
+      bucketName: amzn-s3-demo-bucket
+      # Must match the node's cache type, set by the Helm value above.
+      cache: emptyDir
+```
+
+##### The PV's cache type must match the node's
+
+The cache backing is a property of the node, not of the volume, so a PV cannot choose one. It must instead name the backing the node already has, and the mount is rejected if it does not:
+
+| Helm `cache` block | The PV must set |
+|---|---|
+| `type: emptyDir`, `emptyDir.medium: ""` | `cache: emptyDir` |
+| `type: emptyDir`, `emptyDir.medium: Memory` | `cache: emptyDir` **and** `cacheEmptyDirMedium: Memory` |
+| `type: ephemeral` | `cache: ephemeral` |
+
+`cacheEmptyDirMedium` is the one per-PV cache attribute daemonset mode still reads, because it selects a backing rather than a size. The mount fails with `InvalidArgument` when the PV requests a backing the node does not provide, names a value that is not a cache type (including `true`), or requests a cache when the node has none. The message reports both what was requested and what the node provides.
+
+A PV that enables the cache with the deprecated `mountOptions: cache <dir>` names no type, so it accepts whatever the node provides. This is the only case where the type is not checked.
+
+Mounting a volume that requests a cache fails if the `cache` block is absent, so add it before creating such PVs.
+
+Adding or removing the block changes the DaemonSet's pod spec, and the mounter DaemonSet uses the `OnDelete` update strategy, so existing pods keep running until you delete them. Deleting a mounter pod terminates every Mountpoint process on that node, so drain the node first:
+
+```bash
+kubectl cordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --force
+kubectl delete pod -n kube-system -l app=s3-csi-daemonset-mounter --field-selector spec.nodeName=<node>
+kubectl uncordon <node>
+```
+
+`--delete-emptydir-data` is required because the mounter pod uses `emptyDir` volumes, which `kubectl drain` will not evict otherwise; see [My node drain fails with "cannot delete Pods that declare no controller"](./TROUBLESHOOTING.md#my-node-drain-fails-with-cannot-delete-pods-that-declare-no-controller) for the details and for the PodDisruptionBudget caveat.
+
+> [!IMPORTANT]
+> **Changing `cache.type` or `emptyDir.medium` breaks PVs pinned to the old one.** Because a PV names the node's backing, changing the node's backing makes every PV naming the old one fail to mount. Update those PVs first -- and since `volumeAttributes` are immutable, that means deleting and recreating them, and therefore the workloads bound to them.
+
+> [!IMPORTANT]
+> **Removing the cache is not simply the reverse.** A PV's `volumeAttributes` are immutable, so a PV that requests a cache cannot be edited to stop requesting one. If you remove the `cache` block from `values.yaml` while such PVs still exist, their mounts fail and the driver retries indefinitely. Remove the `cache` volume attribute from every PV first -- which means deleting and recreating those PVs, and therefore the workloads bound to them -- and only then remove the Helm block.
+
+The volume attributes that configure a per-mount cache volume in pod mode (`cacheEmptyDirSizeLimit`, `cacheEmptyDirMedium`, `cacheEphemeralStorageClassName`, `cacheEphemeralStorageResourceRequest`) have no effect in daemonset mode. The driver logs a warning if a PV sets them.
+
+##### Sizing the cache volume
+
+Size the cache volume for the number of mounts you expect on a node, in the same way as the mounter pod's memory request: for `maxVolumesPerNode` mounts each using at most `max-cache-size`, the volume needs `maxVolumesPerNode x max-cache-size`.
+
+Nothing enforces this total. Each Mountpoint process only limits its own cache, so mounts that collectively request more than the volume holds will fill it:
+
+- With `type: ephemeral` the volume is a separate filesystem, so filling it only affects caching -- Mountpoint logs a warning and reads fall through to S3.
+- With `type: emptyDir` the cache shares the node's filesystem with container images, logs, and other pods. Filling it can put the node under disk pressure, which causes the kubelet to evict pods. **Set `max-cache-size` on your PVs when using `emptyDir`**, or use `type: ephemeral` to keep cache growth away from the node's disk.
+
+Note that `emptyDir.sizeLimit` bounds this cache only with `medium: Memory`, where it sizes the tmpfs and the kernel enforces it. On the node's disk it bounds nothing: the kubelet enforces `sizeLimit` by evicting the pod that exceeds it, and it does not evict `system-node-critical` pods such as the mounter DaemonSet.
 
 ### Shared Cache
 

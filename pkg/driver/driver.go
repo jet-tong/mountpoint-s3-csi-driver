@@ -136,8 +136,8 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 			klog.Fatalf("Failed to rebuild mount map from disk: %v", err)
 		}
 
-		if err := dm.DiscoverCommDir(context.Background()); err != nil {
-			klog.Fatalf("Failed to discover mounter pod: %v", err)
+		if err := dm.DiscoverMounterDir(context.Background()); err != nil {
+			klog.Fatalf("Failed to discover mounter pod directory: %v", err)
 		}
 		go dm.StartCommDirWatch(stopCh)
 		go dm.StartPeriodicCleanup(stopCh)
@@ -156,7 +156,7 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 				maxVolumesPerNodeEnvName)
 		}
 
-		nodeServer = node.NewS3NodeServer(nodeID, dm, int64(maxVolumesPerNode))
+		nodeServer = node.NewS3NodeServer(nodeID, dm, int64(maxVolumesPerNode), true)
 	} else {
 		mpMounter := mpmounter.New()
 		podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
@@ -178,7 +178,7 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 		if err != nil {
 			klog.Fatalln(err)
 		}
-		nodeServer = node.NewS3NodeServer(nodeID, podMounter, 0) // maxVolumesPerNode = 0 means no limit
+		nodeServer = node.NewS3NodeServer(nodeID, podMounter, 0, false) // maxVolumesPerNode = 0 means no limit
 	}
 
 	return &Driver{

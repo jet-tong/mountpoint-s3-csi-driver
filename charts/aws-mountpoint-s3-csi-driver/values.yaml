@@ -166,6 +166,34 @@ daemonsetMounters:
       requests:
         memory: "2Gi"
         cpu: "500m"
+    # Local cache for Mountpoint (`--cache`). Uncomment the `cache` block to give this node
+    # one shared cache volume, with a subdirectory per volume. A PV then opts in with the
+    # `cache` volumeAttribute and limits its own usage with `max-cache-size` in mountOptions.
+    #
+    # The type set here is the only one PVs on this node may ask for: a PV's `cache` attribute
+    # (plus `cacheEmptyDirMedium` for emptyDir) must name this backing, or the mount is rejected.
+    # So changing it breaks every PV naming the old one, and `volumeAttributes` are immutable -
+    # see docs/CACHING.md before changing it on a cluster with cached volumes.
+    # Nothing limits the total, so size the volume for maxVolumesPerNode mounts.
+    # A PV that requests a cache fails to mount while this is commented out.
+    #
+    # "emptyDir" shares the node's filesystem, so unbounded growth can put the node under disk
+    # pressure and evict other pods. "ephemeral" is a dedicated volume from your StorageClass
+    # (EBS, instance store): filling it only stops caching, and reads fall back to S3.
+    # Prefer "ephemeral" for large datasets.
+    #
+    # cache:
+    #   # "emptyDir" or "ephemeral"; please uncomment the relevant section for the chosen type.
+    #   type: emptyDir        
+    #   emptyDir:
+    #     sizeLimit: ""
+    #     # "" for the node's disk, or "Memory" for a tmpfs. For "Memory", please refer to 
+    #     # CACHING.md for requesting the appropriate amount of memory for the mounter pod to 
+    #     # prevent OOMKilled errors.
+    #     medium: ""
+    #   ephemeral:
+    #     storageClassName: gp3
+    #     size: 10Gi
     logLevel: 4
     podLabels: {}
     nodeSelector: {}

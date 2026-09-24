@@ -119,8 +119,8 @@ var CSITestSuites = []func() framework.TestSuite{
 	custom_testsuites.InitS3CSIPodSharingDaemonsetTestSuite,
 	custom_testsuites.InitS3CSIResourceCleanupDaemonsetTestSuite,
 	custom_testsuites.InitS3CSIVolumeLimitsTestSuite,
-	// TODO: reenable or rewrite when credentials / cache / pod sharing are implemented for daemonset mode
-	// custom_testsuites.InitS3CSICacheTestSuite,
+	custom_testsuites.InitS3CSICacheTestSuite,
+	custom_testsuites.InitS3CSIDaemonsetCacheTestSuite,
 	// custom_testsuites.InitS3CSIPodSharingTestSuite,
 	// custom_testsuites.InitS3TaintRemovalTestSuite,
 	// custom_testsuites.InitS3CSIEvictionOrderTestSuite,

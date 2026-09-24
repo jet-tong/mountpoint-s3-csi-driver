@@ -23,7 +23,7 @@ func MetaFileName(kubeletPath, volumeID string) string {
 // and for subsequent share requests after driver restart.
 type MountMeta struct {
 	VolumeID                 string   `json:"volumeID"`
-	CommDir                  string   `json:"commDir"`
+	MounterDir               string   `json:"mounterDir"`
 	MountOptions             []string `json:"mountOptions"`
 	AuthenticationSource     string   `json:"authenticationSource"`
 	ServiceAccountName       string   `json:"serviceAccountName"`
@@ -37,7 +37,7 @@ type MountMeta struct {
 func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	meta := MountMeta{
 		VolumeID:                 entry.VolumeID,
-		CommDir:                  entry.CommDir,
+		MounterDir:               entry.MounterDir,
 		MountOptions:             entry.Params.MountOptions,
 		AuthenticationSource:     entry.Params.AuthenticationSource,
 		ServiceAccountName:       entry.Params.ServiceAccountName,

@@ -65,12 +65,15 @@ function helm_install_driver() {
     IRSA_FLAG=""
   fi
 
+  # Note setting a field of daemonsetMounters[0] only keeps the other fields because --values re-supplies them.
   $HELM_BIN upgrade --install $RELEASE_NAME --namespace kube-system ./charts/aws-mountpoint-s3-csi-driver --values \
     ./charts/aws-mountpoint-s3-csi-driver/values.yaml \
     --set image.repository=${REPOSITORY} \
     --set image.tag=${TAG} \
     --set image.pullPolicy=Always \
     --set node.serviceAccount.create=true \
+    --set daemonsetMounters[0].cache.type=emptyDir \
+    --set daemonsetMounters[0].cache.emptyDir.sizeLimit=10Gi \
     ${IRSA_FLAG} \
     --kubeconfig ${KUBECONFIG}
   $KUBECTL_BIN rollout status daemonset s3-csi-node -n kube-system --timeout=60s --kubeconfig $KUBECONFIG

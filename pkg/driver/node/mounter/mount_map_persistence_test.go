@@ -428,12 +428,12 @@ func TestRebuildMountMap_CleansUpDeadSourceMounts(t *testing.T) {
 func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 	kubeletPath := t.TempDir()
 	sourcePath := SourceMountPath(kubeletPath, "vol-live")
-	commDir := "/var/lib/kubelet/pods/mounter-uid-abc/volumes/kubernetes.io~empty-dir/comm"
+	mounterDir := "/var/lib/kubelet/pods/mounter-uid-abc/volumes"
 
 	entry := &MountEntry{
 		VolumeID:   "vol-live",
 		SourcePath: sourcePath,
-		CommDir:    commDir,
+		MounterDir: mounterDir,
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other"},
 			AuthenticationSource:     "pod",
@@ -463,7 +463,7 @@ func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 	}
 
 	assert.Equals(t, sourcePath, recovered.SourcePath)
-	assert.Equals(t, commDir, recovered.CommDir)
+	assert.Equals(t, mounterDir, recovered.MounterDir)
 	assert.Equals(t, 3, recovered.RefCount)
 	assert.Equals(t, 3, len(recovered.Targets))
 	assert.Equals(t, true, recovered.sourceMounted)
@@ -609,7 +609,8 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	kubeletPath := t.TempDir()
 
 	// Create a comm dir with credential files that should be cleaned up
-	commDir := filepath.Join(kubeletPath, "pods", "mounter-uid", "volumes", "kubernetes.io~empty-dir", "comm")
+	mounterDir := filepath.Join(kubeletPath, "pods", "mounter-uid", "volumes")
+	commDir := commDirForMounterDir(mounterDir)
 	credDir := filepath.Join(commDir, "vol-dead-creds")
 	err := os.MkdirAll(credDir, 0750)
 	assert.NoError(t, err)
@@ -621,7 +622,7 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	entry := &MountEntry{
 		VolumeID:   "vol-dead-creds",
 		SourcePath: SourceMountPath(kubeletPath, "vol-dead-creds"),
-		CommDir:    commDir,
+		MounterDir: mounterDir,
 		Params:     MountParams{AuthenticationSource: "driver"},
 	}
 	err = WriteMeta(kubeletPath, entry)
@@ -652,10 +653,10 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 }
 
 // seedEntry inserts a source-mounted entry into the map. i.e pretend a mount already exists
-func seedEntry(dm *DaemonsetMounter, volumeID, sourcePath, commDir string, targets []string) *MountEntry {
+func seedEntry(dm *DaemonsetMounter, volumeID, sourcePath, mounterDir string, targets []string) *MountEntry {
 	entry, _ := dm.mountMap.GetOrCreate(volumeID)
 	entry.SourcePath = sourcePath
-	entry.CommDir = commDir
+	entry.MounterDir = mounterDir
 	entry.Params = MountParams{AuthenticationSource: "driver"}
 	entry.Targets = targets
 	entry.RefCount = len(targets)

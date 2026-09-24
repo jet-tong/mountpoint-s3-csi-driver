@@ -94,10 +94,11 @@ type MountEntry struct {
 	// error file name, and mount identifier when communicating with the secondary daemonset.
 	VolumeID string
 
-	// CommDir is the comm directory path at the time this mount was created.
+	// MounterDir is the mounter pod's volumes directory at the time this mount was created.
+	// The comm and cache volumes are derived from it.
 	// Cleanup uses this to ensure resources are cleaned in the same location where they were
 	// provisioned, avoiding mismatches if the mounter pod restarts between mount and unmount.
-	CommDir string
+	MounterDir string
 
 	// Params records the mount parameters for validation of subsequent share requests.
 	Params MountParams

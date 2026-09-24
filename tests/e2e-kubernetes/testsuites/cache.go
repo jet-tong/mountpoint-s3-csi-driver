@@ -162,19 +162,28 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 			enhanceContext = func(ctx context.Context) context.Context { return ctx }
 			expressCacheBucketName = ""
 
+			// In daemonset mode the cache volume belongs to the mounter DaemonSet and is configured
+			// with Helm values, so a PV only opts in. The attributes that describe a per-mount volume
+			// have no effect, and the volume type is whatever the DaemonSet was installed with.
+			daemonsetMode := isDaemonsetMounterMode(ctx, f)
+
 			switch config.localCacheKind {
 			case localCacheMountOptions:
 				cacheDir := randomCacheDir()
 				baseMountOptions = append(baseMountOptions, fmt.Sprintf("cache %s", cacheDir))
 			case localCacheEmptyDir:
+				attributes := map[string]string{"cache": "emptyDir"}
+				if !daemonsetMode {
+					attributes["cacheEmptyDirSizeLimit"] = "32Mi"
+					attributes["cacheEmptyDirMedium"] = "Memory"
+				}
 				enhanceContext = func(ctx context.Context) context.Context {
-					return contextWithVolumeAttributes(ctx, map[string]string{
-						"cache":                  "emptyDir",
-						"cacheEmptyDirSizeLimit": "32Mi",
-						"cacheEmptyDirMedium":    "Memory",
-					})
+					return contextWithVolumeAttributes(ctx, attributes)
 				}
 			case localCacheEBSEphemeral:
+				if daemonsetMode {
+					Skip("cache.type is configured on the mounter DaemonSet in daemonset mode, not per PV")
+				}
 				scName := createEBSCacheSC(ctx, f)
 				enhanceContext = func(ctx context.Context) context.Context {
 					return contextWithVolumeAttributes(ctx, map[string]string{
@@ -369,6 +378,7 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 			})
 		})
 
+		// TODO: Add express test for daemonset mode
 		Describe("Express", Serial, func() {
 			testCache(cacheTestConfig{
 				useExpressCache: true,
@@ -396,30 +406,20 @@ func randomCacheDir() string {
 // It automatically cleans up SC after the test-case.
 func createEBSCacheSC(ctx context.Context, f *framework.Framework) string {
 	scName := f.UniqueName + "-sc"
+	deleteSC := createEBSCacheStorageClass(ctx, f, scName)
+	DeferCleanup(deleteSC)
+	return scName
+}
 
-	sc := &storagev1.StorageClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: scName,
-		},
+// ebsCacheStorageClass is the StorageClass spec used for an EBS-backed cache in both modes.
+func ebsCacheStorageClass(name string) *storagev1.StorageClass {
+	return &storagev1.StorageClass{
+		ObjectMeta:        metav1.ObjectMeta{Name: name},
 		Provisioner:       "ebs.csi.aws.com",
 		VolumeBindingMode: ptr.To(storagev1.VolumeBindingWaitForFirstConsumer),
 		ReclaimPolicy:     ptr.To(v1.PersistentVolumeReclaimDelete),
-		Parameters: map[string]string{
-			"encrypted": "true",
-		},
+		Parameters:        map[string]string{"encrypted": "true"},
 	}
-
-	framework.Logf("Creating StorageClass %s with EBS CSI Driver provisioner", scName)
-	_, err := f.ClientSet.StorageV1().StorageClasses().Create(ctx, sc, metav1.CreateOptions{})
-	framework.ExpectNoError(err, "Failed to create StorageClass for cache")
-
-	DeferCleanup(func(ctx context.Context) {
-		framework.Logf("Deleting StorageClass %s", scName)
-		err := f.ClientSet.StorageV1().StorageClasses().Delete(ctx, scName, metav1.DeleteOptions{})
-		framework.ExpectNoError(err, "Failed to delete StorageClass for cache")
-	})
-
-	return scName
 }
 
 // ebsCSIDriverDaemonSet returns the DaemonSet of EBS CSI Driver if its installed in the cluster.

@@ -48,7 +48,9 @@ type dmTestCtx struct {
 	podUID        string
 	mounterPodUID string
 	kubeletPath   string
+	mounterDir    string
 	commDir       string
+	cacheDir      string
 }
 
 // targetPath returns a valid kubelet-style target path that targetpath.Parse can parse.
@@ -82,7 +84,12 @@ func setupDM(t *testing.T) *dmTestCtx {
 	nodeName := "test-node"
 	mounterPodUID := uuid.New().String()
 
-	commDir := filepath.Join(kubeletPath, "pods", mounterPodUID, "volumes", "kubernetes.io~empty-dir", mounter.CommVolumeName)
+	// Both volumes live under the mounter pod's volumes dir; the driver derives them from it.
+	// The cache volume is deliberately not created here - only the cache tests create it, so
+	// every other test exercises the caching-disabled path.
+	mounterDir := filepath.Join(kubeletPath, "pods", mounterPodUID, "volumes")
+	commDir := filepath.Join(mounterDir, "kubernetes.io~empty-dir", mounter.CommVolumeName)
+	cacheDir := filepath.Join(mounterDir, "kubernetes.io~empty-dir", mounter.CacheVolumeName)
 	err = os.MkdirAll(commDir, 0750)
 	assert.NoError(t, err)
 
@@ -115,7 +122,9 @@ func setupDM(t *testing.T) *dmTestCtx {
 		podUID:        podUID,
 		mounterPodUID: mounterPodUID,
 		kubeletPath:   kubeletPath,
+		mounterDir:    mounterDir,
 		commDir:       commDir,
+		cacheDir:      cacheDir,
 	}
 
 	mountSyscall := func(target string, opts mpmounter.MountOptions) (int, error) {
@@ -146,7 +155,7 @@ func setupDM(t *testing.T) *dmTestCtx {
 		}
 		return infos, nil
 	}, testK8sVersion, cluster.DefaultKubernetes)
-	err = dm.DiscoverCommDir(ctx)
+	err = dm.DiscoverMounterDir(ctx)
 	assert.NoError(t, err)
 
 	testCtx.dm = dm
@@ -207,6 +216,76 @@ func TestDaemonsetMounter(t *testing.T) {
 			}, got)
 		})
 
+		// The bug this guards against shipped once: node.go named the directory from the PV's
+		// volumeHandle while the create path used the PV name, so --cache pointed somewhere nothing
+		// created. Asserting both sides agree is what makes that a failure rather than a silent one.
+		t.Run("Creates the cache directory --cache points at, and removes it on unmount", func(t *testing.T) {
+			testCtx := setupDM(t)
+
+			// The PV name must differ from the CSI volume ID (the PV's volumeHandle), or a mix-up
+			// between the two is invisible. The kubelet target path carries the PV name.
+			pvName := "s3-pv-name-differs-from-handle"
+			target := filepath.Join(testCtx.kubeletPath, "pods", testCtx.podUID, "volumes", "kubernetes.io~csi", pvName, "mount")
+
+			// Give the mounter a cache volume; setupDM deliberately leaves it absent.
+			assert.NoError(t, os.MkdirAll(testCtx.cacheDir, 0777))
+
+			devNull := mountertest.OpenDevNull(t)
+			testCtx.mountSyscall = func(target string, opts mpmounter.MountOptions) (int, error) {
+				testCtx.mount.Mount("mountpoint-s3", target, "fuse", nil)
+				fd, err := syscall.Dup(int(devNull.Fd()))
+				assert.NoError(t, err)
+				return fd, nil
+			}
+
+			// What a PV would carry: the deprecated form, whose path the driver discards.
+			args := mountpoint.ParseArgs([]string{"--cache=/ignored/path/from/the/pv"})
+
+			mountRes := make(chan error)
+			go func() {
+				mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+					WorkloadPodID: testCtx.podUID,
+					VolumeID:      testCtx.volumeID,
+				}, args, "", nil)
+			}()
+
+			got := testCtx.receiveMountOptions()
+			sourcePath := mounter.SourceMountPath(testCtx.kubeletPath, pvName)
+			testCtx.mount.Mount("mountpoint-s3", sourcePath, "fuse", nil)
+			assert.NoError(t, <-mountRes)
+
+			gotFile := os.NewFile(uintptr(got.Fd), "fd")
+			t.Cleanup(func() { gotFile.Close() })
+
+			// The directory the driver created on the node, named after the PV.
+			mountCacheDir := filepath.Join(testCtx.cacheDir, pvName)
+			fi, err := os.Stat(mountCacheDir)
+			assert.NoError(t, err)
+			assert.Equals(t, true, fi.IsDir())
+
+			// ...must be the directory Mountpoint was told to use. These are the same directory
+			// seen from the node and from inside the mounter, so the trailing element must match.
+			var cacheArg string
+			for _, a := range got.Args {
+				if strings.HasPrefix(a, "--cache=") {
+					cacheArg = strings.TrimPrefix(a, "--cache=")
+				}
+			}
+			// Literal, not MountpointCacheDir(pvName): the root must equal the chart's
+			// `mountPath: /cache` in mounter-daemonset.yaml, and comparing the production value
+			// against the production function would not catch that moving.
+			assert.Equals(t, "/cache/"+pvName, cacheArg)
+			assert.Equals(t, filepath.Base(mountCacheDir), filepath.Base(cacheArg))
+
+			err = testCtx.dm.Unmount(testCtx.ctx, target, credentialprovider.CleanupContext{
+				VolumeID: pvName,
+			})
+			assert.NoError(t, err)
+
+			_, err = os.Stat(mountCacheDir)
+			assert.Equals(t, true, os.IsNotExist(err))
+		})
+
 		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
 			mockCtl := gomock.NewController(t)
 			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
@@ -234,7 +313,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				}, func(source, target string) error {
 					return testCtx.mount.Mount(source, target, "bind", []string{"bind"})
 				}, nil, "", cluster.DefaultKubernetes)
-			err := testCtx.dm.DiscoverCommDir(testCtx.ctx)
+			err := testCtx.dm.DiscoverMounterDir(testCtx.ctx)
 			assert.NoError(t, err)
 
 			err = os.MkdirAll(target, 0755)
@@ -292,7 +371,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				}, func(source, target string) error {
 					return testCtx.mount.Mount(source, target, "bind", []string{"bind"})
 				}, nil, "", cluster.DefaultKubernetes)
-			err := testCtx.dm.DiscoverCommDir(testCtx.ctx)
+			err := testCtx.dm.DiscoverMounterDir(testCtx.ctx)
 			assert.NoError(t, err)
 
 			err = testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
@@ -459,7 +538,7 @@ func TestDaemonsetMounter(t *testing.T) {
 					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 					defer cancel()
 
-					err := dm.DiscoverCommDir(ctx)
+					err := dm.DiscoverMounterDir(ctx)
 					t.Logf("%v", err)
 					if err == nil {
 						t.Fatal("expected error from DiscoverCommDir")
@@ -493,7 +572,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx := setupDM(t)
 			target := testCtx.targetPath(testCtx.podUID)
 
-			// Create a fresh DM which has not discovered commDir (setupDM called dm.DiscoverCommDir(ctx))
+			// Create a fresh DM which has not discovered commDir (setupDM called dm.DiscoverMounterDir(ctx))
 			// and has no StartCommDirWatch process to populate it.
 			mountSyscallCalled := false
 			testCtx.dm = mounter.NewDaemonsetMounter(
@@ -549,7 +628,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			assert.Contains(t, err.Error(), "failed to send mount options")
 
 			// Verify commDir was nilled by the staleness detection
-			_, err = testCtx.dm.GetCommDir()
+			_, err = testCtx.dm.GetMounterDir()
 			assert.ErrorIs(t, err, mounter.ErrCommDirNotReady)
 		})
 
@@ -583,7 +662,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			}
 
 			// Verify commDir was NOT nilled by the cancelled context
-			_, err = testCtx.dm.GetCommDir()
+			_, err = testCtx.dm.GetMounterDir()
 			assert.NoError(t, err)
 		})
 	})
@@ -639,6 +718,108 @@ func TestDaemonsetMounter_PodSharing(t *testing.T) {
 		assert.Equals(t, 1, fuseMountCount)
 	})
 
+	t.Run("Cache directory survives until the last consumer unmounts", func(t *testing.T) {
+		testCtx := setupDM(t)
+		pvName := "s3-pv-shared-cache"
+		target1 := filepath.Join(testCtx.kubeletPath, "pods", "pod-a-uid", "volumes", "kubernetes.io~csi", pvName, "mount")
+		target2 := filepath.Join(testCtx.kubeletPath, "pods", "pod-b-uid", "volumes", "kubernetes.io~csi", pvName, "mount")
+		mountCacheDir := filepath.Join(testCtx.cacheDir, pvName)
+
+		assert.NoError(t, os.MkdirAll(testCtx.cacheDir, 0777))
+
+		devNull := mountertest.OpenDevNull(t)
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(devNull.Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		cacheArgs := func() mountpoint.Args { return mountpoint.ParseArgs([]string{"cache /ignored"}) }
+		provideCtx := func(podUID string) credentialprovider.ProvideContext {
+			return credentialprovider.ProvideContext{
+				WorkloadPodID: podUID, VolumeID: testCtx.volumeID,
+				AuthenticationSource: "driver", ServiceAccountName: "default", PodNamespace: "default",
+			}
+		}
+
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target1, provideCtx("pod-a-uid"), cacheArgs(), "", nil)
+		}()
+		testCtx.receiveMountOptions()
+		testCtx.mount.Mount("mountpoint-s3", mounter.SourceMountPath(testCtx.kubeletPath, pvName), "fuse", nil)
+		assert.NoError(t, <-mountRes)
+
+		// Second consumer shares the existing source mount, so no new FUSE mount and no new cache dir.
+		assert.NoError(t, testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target2, provideCtx("pod-b-uid"), cacheArgs(), "", nil))
+
+		_, err := os.Stat(mountCacheDir)
+		assert.NoError(t, err)
+
+		// First consumer leaves: the mount is still live, so its cache must not be touched.
+		assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target1, credentialprovider.CleanupContext{VolumeID: pvName}))
+		_, err = os.Stat(mountCacheDir)
+		assert.NoError(t, err)
+
+		// Last consumer leaves: now it goes.
+		assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target2, credentialprovider.CleanupContext{VolumeID: pvName}))
+		_, err = os.Stat(mountCacheDir)
+		assert.Equals(t, true, os.IsNotExist(err))
+
+		// The shared volume root must survive - it holds every other mount's cache.
+		_, err = os.Stat(testCtx.cacheDir)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Orphan cache directories are swept while live ones are kept", func(t *testing.T) {
+		testCtx := setupDM(t)
+		pvName := "s3-pv-live"
+		target := filepath.Join(testCtx.kubeletPath, "pods", "pod-a-uid", "volumes", "kubernetes.io~csi", pvName, "mount")
+
+		assert.NoError(t, os.MkdirAll(testCtx.cacheDir, 0777))
+
+		devNull := mountertest.OpenDevNull(t)
+		testCtx.mountSyscall = func(tgt string, opts mpmounter.MountOptions) (int, error) {
+			testCtx.mount.Mount("mountpoint-s3", tgt, "fuse", nil)
+			fd, err := syscall.Dup(int(devNull.Fd()))
+			assert.NoError(t, err)
+			return fd, nil
+		}
+
+		mountRes := make(chan error)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+				WorkloadPodID: "pod-a-uid", VolumeID: testCtx.volumeID,
+				AuthenticationSource: "driver", ServiceAccountName: "default", PodNamespace: "default",
+			}, mountpoint.ParseArgs([]string{"cache /ignored"}), "", nil)
+		}()
+		testCtx.receiveMountOptions()
+		testCtx.mount.Mount("mountpoint-s3", mounter.SourceMountPath(testCtx.kubeletPath, pvName), "fuse", nil)
+		assert.NoError(t, <-mountRes)
+
+		// A directory no meta file or map entry mentions - what a crash between createCacheDir and
+		// WriteMeta leaves behind. Plus the two entries that must never be touched.
+		orphan := filepath.Join(testCtx.cacheDir, "s3-pv-from-a-crashed-driver")
+		assert.NoError(t, os.Mkdir(orphan, 0770))
+		lostFound := filepath.Join(testCtx.cacheDir, "lost+found")
+		assert.NoError(t, os.Mkdir(lostFound, 0700))
+		strayFile := filepath.Join(testCtx.cacheDir, "not-a-directory")
+		assert.NoError(t, os.WriteFile(strayFile, []byte("x"), 0600))
+
+		testCtx.dm.CleanupOrphans()
+
+		_, err := os.Stat(orphan)
+		assert.Equals(t, true, os.IsNotExist(err))
+
+		// The live mount's cache, lost+found on an ext4 ephemeral volume, and anything that is not
+		// a directory all survive.
+		for _, keep := range []string{filepath.Join(testCtx.cacheDir, pvName), lostFound, strayFile} {
+			_, err := os.Stat(keep)
+			assert.NoError(t, err)
+		}
+	})
+
 	t.Run("Second pod rejected with different service account (pod auth) without overwriting credentials", func(t *testing.T) {
 		mockCtl := gomock.NewController(t)
 		mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
@@ -667,7 +848,7 @@ func TestDaemonsetMounter_PodSharing(t *testing.T) {
 			testCtx.mountSyscall, func(source, target string) error {
 				return testCtx.mount.Mount(source, target, "bind", []string{"bind"})
 			}, nil, "", cluster.DefaultKubernetes)
-		err := testCtx.dm.DiscoverCommDir(testCtx.ctx)
+		err := testCtx.dm.DiscoverMounterDir(testCtx.ctx)
 		assert.NoError(t, err)
 
 		// Mount first pod with sa-a using pod auth
