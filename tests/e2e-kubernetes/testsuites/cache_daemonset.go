@@ -28,8 +28,6 @@ const (
 	// The DaemonSet the cache volume is attached to, and the container that sees it.
 	mounterDaemonSetName  = "s3-csi-daemonset-mounter"
 	mounterDaemonSetLabel = "app=s3-csi-daemonset-mounter"
-	mounterContainerName  = "mounter"
-	csiNodeContainerName  = "s3-plugin"
 
 	// Where the chart mounts the mounter's cache volume; spelled out as the contract between the chart's volumeMounts and `--cache`.
 	cacheMountPath = "/cache"
@@ -975,47 +973,4 @@ func runOnNode(ctx context.Context, f *framework.Framework, mounter *v1.Pod, cmd
 		return "", fmt.Errorf("%q on node %s: %w", cmd, mounter.Spec.NodeName, err)
 	}
 	return strings.TrimSpace(stdout), nil
-}
-
-// TODO: delete everything below when #968 lands; it is copied from that PR's util.go, which declares all of it.
-
-// The csi-node DaemonSet, which the per-mount cache paths are read from.
-const csiNodePodLabel = "app=s3-csi-node"
-
-// podOnNode returns the driver pod matching `label` on `nodeName`.
-func podOnNode(ctx context.Context, f *framework.Framework, label, nodeName string) (*v1.Pod, error) {
-	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
-		LabelSelector: label,
-		FieldSelector: "spec.nodeName=" + nodeName,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listing %s pods on node %s: %w", label, nodeName, err)
-	}
-	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("no %s pod on node %s", label, nodeName)
-	}
-	return &pods.Items[0], nil
-}
-
-// execInPodOnNode runs `cmd` in `container` of the pod matching `label` on `nodeName`, returning its
-// stdout and stderr.
-//
-// stderr matters: a spec asserting that access is *refused* needs to distinguish the kernel denying it
-// from the command having failed for any other reason.
-func execInPodOnNode(ctx context.Context, f *framework.Framework, label, container, nodeName, cmd string) (string, string, error) {
-	pod, err := podOnNode(ctx, f, label, nodeName)
-	if err != nil {
-		return "", "", err
-	}
-	return execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, pod.Name, container,
-		[]string{"/bin/sh", "-c", cmd})
-}
-
-// execInCSINodePod runs `cmd` in the csi-node pod on `nodeName`.
-//
-// csi-node is the right observer for the per-mount paths: it is privileged, so unlike the mounter it
-// can read a directory owned by a mount's UID, and it is the component that applied that ownership.
-func execInCSINodePod(ctx context.Context, f *framework.Framework, nodeName, cmd string) (string, error) {
-	stdout, _, err := execInPodOnNode(ctx, f, csiNodePodLabel, csiNodeContainerName, nodeName, cmd)
-	return stdout, err
 }
