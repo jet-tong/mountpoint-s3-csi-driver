@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,26 +26,49 @@ import (
 const errorFilePerm = fs.FileMode(0600)
 const errorFileExt = ".error"
 
+// cacheRootPerm lets a Mountpoint reach its own cache directory but not create or list entries beside it.
+const cacheRootPerm = fs.FileMode(0711)
+
+// cacheDirPerm closes a mount's cache directory to every UID but the one its Mountpoint runs as.
+const cacheDirPerm = fs.FileMode(0700)
+
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
-	commDir string
-	runner  ProcessRunner // interface for spawning processes; substituted in tests
-	memory  memoryLimit
-	cache   cacheLimit
+	commDir  string
+	cacheDir string        // the cache volume's mount path, or "" when this container has none
+	runner   ProcessRunner // interface for spawning processes; substituted in tests
+	memory   memoryLimit
+	cache    cacheLimit
+	lchown   func(path string, uid, gid int) error // nil = os.Lchown; tests are not root, so they record instead
 
 	mu        sync.Mutex
 	processes map[string]ProcessHandle // mountId -> process handle
 	wg        sync.WaitGroup           // tracks waiter goroutines
 }
 
-func NewProcessManager(commDir string, runner ProcessRunner, memory memoryLimit, cache cacheLimit) *ProcessManager {
+func NewProcessManager(commDir, cacheDir string, runner ProcessRunner, memory memoryLimit, cache cacheLimit) *ProcessManager {
 	return &ProcessManager{
 		commDir:   commDir,
+		cacheDir:  cacheDir,
 		runner:    runner,
 		memory:    memory,
 		cache:     cache,
 		processes: make(map[string]ProcessHandle),
 	}
+}
+
+// secureCacheRoot stops every Mountpoint creating or listing entries in the cache volume.
+func (pm *ProcessManager) secureCacheRoot() error {
+	if pm.cacheDir == "" {
+		return nil
+	}
+	if err := pm.lchownWithDefault(pm.cacheDir, 0, 0); err != nil {
+		return fmt.Errorf("failed to chown cache volume %q to root: %w", pm.cacheDir, err)
+	}
+	if err := os.Chmod(pm.cacheDir, cacheRootPerm); err != nil {
+		return fmt.Errorf("failed to chmod cache volume %q to %o: %w", pm.cacheDir, cacheRootPerm, err)
+	}
+	return nil
 }
 
 // Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
@@ -67,6 +91,19 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	args := mountpoint.ParseArgs(options.Args)
 	args.Set(mountpoint.ArgForeground, mountpoint.ArgNoValue)
+
+	// We point --cache at a directory derived here, so the one created and handed to the UID is the one Mountpoint uses.
+	cached := args.Has(mountpoint.ArgCache)
+	for args.Has(mountpoint.ArgCache) {
+		args.Remove(mountpoint.ArgCache)
+	}
+	if cached {
+		if pm.cacheDir == "" {
+			fuseDev.Close()
+			return fmt.Errorf("refusing to launch mount %s: it requests a cache, but this container has no cache volume", mountId)
+		}
+		args.Set(mountpoint.ArgCache, filepath.Join(pm.cacheDir, mountId))
+	}
 
 	if targetMiB := pm.memory.targetFor(mountId, args); targetMiB > 0 {
 		args.Set(mountpoint.ArgMemoryTarget, strconv.FormatInt(targetMiB, 10))
@@ -106,8 +143,22 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		return fmt.Errorf("mount %s already has a running process", mountId)
 	}
 
+	// After the duplicate check, so a relaunch cannot replace a directory a live Mountpoint is using.
+	if cached {
+		if err := pm.createCacheDir(mountId, options.Uid, options.Gid); err != nil {
+			pm.mu.Unlock()
+			fuseDev.Close()
+			return err
+		}
+	}
+
 	handle, err := pm.runner.Start(cmd)
 	if err != nil {
+		if cached {
+			if rmErr := removeCacheDir(pm.cacheDir, mountId); rmErr != nil {
+				klog.Errorf("Failed to remove cache directory of mount %s after a failed start: %v", mountId, rmErr)
+			}
+		}
 		pm.mu.Unlock()
 		fuseDev.Close()
 		return fmt.Errorf("failed to start Mountpoint: %w", err)
@@ -126,6 +177,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		defer pm.wg.Done()
 		exitCode, stderr := handle.Wait()
 
+		// Before freeing mountId, so a relaunch cannot create the directory this then removes.
+		if cached {
+			if err := removeCacheDir(pm.cacheDir, mountId); err != nil {
+				klog.Errorf("Failed to remove cache directory of mount %s: %v", mountId, err)
+			}
+		}
+
 		pm.mu.Lock()
 		delete(pm.processes, mountId)
 		pm.mu.Unlock()
@@ -139,6 +197,43 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	}()
 
 	return nil
+}
+
+// createCacheDir creates a mount's cache directory, owned by the UID its Mountpoint runs as. Mountpoint
+// requires it to exist before it starts, as it only creates its own `mountpoint-cache` directory inside it.
+func (pm *ProcessManager) createCacheDir(mountId string, uid, gid uint32) error {
+	// Replace rather than re-own a leftover: what an earlier Mountpoint wrote inside stays owned by its UID.
+	if err := removeCacheDir(pm.cacheDir, mountId); err != nil {
+		return fmt.Errorf("failed to remove leftover cache directory for mount %s: %w", mountId, err)
+	}
+	mountCacheDir := filepath.Join(pm.cacheDir, mountId)
+	if err := os.Mkdir(mountCacheDir, cacheDirPerm); err != nil {
+		return fmt.Errorf("failed to create cache directory %q for mount %s: %w", mountCacheDir, mountId, err)
+	}
+	if err := pm.lchownWithDefault(mountCacheDir, int(uid), int(gid)); err != nil {
+		return fmt.Errorf("failed to hand cache directory %q to UID %d for mount %s: %w", mountCacheDir, uid, mountId, err)
+	}
+
+	klog.V(4).Infof("Created cache directory %s for mount %s", mountCacheDir, mountId)
+	return nil
+}
+
+// removeCacheDir removes a mount's cache directory. Mountpoint removes its own cache when it exits
+// cleanly, so this covers the cases it misses, such as being killed.
+func removeCacheDir(cacheDir, mountId string) error {
+	// We guard escapes and partial cache delete attempts by checking the cacheDir and mountId, and returning error if something is wrong.
+	// handleConnection already validates mountId; so only a new caller of Launch could lead to these problems.
+	if cacheDir == "" || mountId == "" || mountId == "." || mountId == ".." || strings.ContainsRune(mountId, filepath.Separator) {
+		return fmt.Errorf("refusing to remove cache directory %q for mount %q: not a cache volume and a plain directory name", cacheDir, mountId)
+	}
+	return os.RemoveAll(filepath.Join(cacheDir, mountId))
+}
+
+func (pm *ProcessManager) lchownWithDefault(path string, uid, gid int) error {
+	if pm.lchown != nil {
+		return pm.lchown(path, uid, gid)
+	}
+	return os.Lchown(path, uid, gid)
 }
 
 // writeErrorFile reports a mount failure to the driver, whose waitForMount polls for this file — the

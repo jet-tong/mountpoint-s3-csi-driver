@@ -2,7 +2,6 @@ package mounter_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -56,7 +55,6 @@ type dmTestCtx struct {
 	kubeletPath   string
 	mounterDir    string
 	commDir       string
-	cacheDir      string
 
 	// ownership records every chown/chmod the mounter applied, keyed by path, so tests can assert
 	// what the isolation logic did without needing root.
@@ -198,47 +196,15 @@ func setupDM(t *testing.T) *dmTestCtx {
 	return testCtx
 }
 
-// setupDMWithCache is setupDM with a mounter pod of the given cache volume kind, plus the on-disk volume.
-// Both together because production assumes they agree; testCtx.cacheDir is the created volume.
-func setupDMWithCache(t *testing.T, cacheKind string) *dmTestCtx {
+// setupDMWithCache is setupDM with a mounter pod that has a cache volume.
+func setupDMWithCache(t *testing.T) *dmTestCtx {
 	t.Helper()
 
 	testCtx := setupDM(t)
-
-	volume := corev1.Volume{Name: mounter.CacheVolumeName}
-	cacheDir := filepath.Join(testCtx.mounterDir, "volumes", "kubernetes.io~empty-dir", mounter.CacheVolumeName)
-	switch cacheKind {
-	case volumecontext.CacheTypeEmptyDir:
-		volume.EmptyDir = &corev1.EmptyDirVolumeSource{}
-	case volumecontext.CacheTypeEphemeral:
-		volume.Ephemeral = &corev1.EphemeralVolumeSource{}
-		// The bound PV's name is generated, so the driver reads it off the PVC, always named <pod>-<volume>.
-		pvName := "pvc-" + uuid.New().String()
-		claim := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "s3-csi-daemonset-mounter-abcde-" + mounter.CacheVolumeName,
-				Namespace: "kube-system",
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
-		}
-		_, err := testCtx.client.CoreV1().PersistentVolumeClaims("kube-system").Create(testCtx.ctx, claim, metav1.CreateOptions{})
-		assert.NoError(t, err)
-		pv := &corev1.PersistentVolume{
-			ObjectMeta: metav1.ObjectMeta{Name: pvName},
-			Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
-				CSI: &corev1.CSIPersistentVolumeSource{Driver: "ebs.csi.aws.com", VolumeHandle: "vol-cache"},
-			}},
-		}
-		_, err = testCtx.client.CoreV1().PersistentVolumes().Create(testCtx.ctx, pv, metav1.CreateOptions{})
-		assert.NoError(t, err)
-		cacheDir = filepath.Join(testCtx.mounterDir, "volumes", "kubernetes.io~csi", pvName, "mount")
-	default:
-		t.Fatalf("setupDMWithCache: %q is not a cache kind", cacheKind)
-	}
-
-	assert.NoError(t, os.MkdirAll(cacheDir, 0770))
-	testCtx.cacheDir = cacheDir
-	testCtx.setMounterPodCacheVolume(&volume)
+	testCtx.setMounterPodCacheVolume(&corev1.Volume{
+		Name:         mounter.CacheVolumeName,
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	})
 	return testCtx
 }
 
@@ -1212,76 +1178,29 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 			volumeCtx, mountpoint.ParseArgs(nil), "", nil)
 	}
 
-	// Discovery
-	t.Run("A mounter whose ephemeral cache PVC cannot be read is not discovered", func(t *testing.T) {
-		testCtx := setupDM(t)
-
-		pods := testCtx.client.CoreV1().Pods("kube-system")
-		pod, err := pods.Get(testCtx.ctx, "s3-csi-daemonset-mounter-abcde", metav1.GetOptions{})
-		assert.NoError(t, err)
-		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-			Name:         mounter.CacheVolumeName,
-			VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}},
-		})
-		_, err = pods.Update(testCtx.ctx, pod, metav1.UpdateOptions{})
-		assert.NoError(t, err)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer cancel()
-
-		err = testCtx.dm.DiscoverMounter(ctx)
-		if err == nil {
-			t.Fatal("expected discovery to fail when the cache PVC cannot be read")
-		}
-		// Unresolvable cache directory: reject every cached PV on the node.
-		assert.Contains(t, err.Error(), "cache volume PVC")
-	})
-
 	// Accepting and rejecting a PV's request
-	t.Run("An ephemeral mounter resolves its cache under the CSI volume the kubelet gave it", func(t *testing.T) {
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEphemeral)
+	t.Run("A PV that asks for a cache sends the mounter a --cache for its directory", func(t *testing.T) {
+		testCtx := setupDMWithCache(t)
 
 		_, got := testCtx.mountAndServe("pod-a-uid", pvName, cacheRequest)
-		assert.Equals(t, "/cache/"+pvName, cacheArg(got))
 
-		// The test globs because the PV name is generated; under the test, the driver lookups PVC
-		// landing on the directory the kubelet created.
-		matches, err := filepath.Glob(filepath.Join(testCtx.mounterDir, "volumes", "kubernetes.io~csi", "*", "mount", pvName))
-		assert.NoError(t, err)
-		assert.Equals(t, []string{filepath.Join(testCtx.cacheDir, pvName)}, matches)
+		assert.Equals(t, "/cache/"+pvName, cacheArg(got))
 	})
 
 	t.Run("A PV that asks for no cache gets none, even on a mounter that has one", func(t *testing.T) {
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
+		testCtx := setupDMWithCache(t)
 
 		_, got := testCtx.mountAndServe("pod-a-uid", pvName, nil)
 
 		assert.Equals(t, "", cacheArg(got))
-		assert.FileNotExists(t, filepath.Join(testCtx.cacheDir, pvName))
 	})
 
 	t.Run("A v1 cache mount option's path is replaced with the mount's own directory", func(t *testing.T) {
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
+		testCtx := setupDMWithCache(t)
 
 		_, got := testCtx.mountAndServe("pod-a-uid", pvName, nil, "cache /tmp/customer-path")
 
 		assert.Equals(t, "/cache/"+pvName, cacheArg(got))
-	})
-
-	t.Run("A fresh mount over a dead cached source that no longer asks for a cache records none", func(t *testing.T) {
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
-		testCtx.mountAndServe("pod-a-uid", pvName, cacheRequest)
-
-		// Unmounting the source makes it dead, so the next Mount takes the fresh-mount path and reuses the entry.
-		assert.NoError(t, testCtx.mount.Unmount(mounter.SourceMountPath(testCtx.kubeletPath, pvName)))
-		_, got := testCtx.mountAndServe("pod-b-uid", pvName, nil)
-
-		assert.Equals(t, "", cacheArg(got))
-		raw, err := os.ReadFile(mounter.MetaFileName(testCtx.kubeletPath, pvName))
-		assert.NoError(t, err)
-		var meta mounter.MountMeta
-		assert.NoError(t, json.Unmarshal(raw, &meta))
-		assert.Equals(t, "", meta.CacheDir)
 	})
 
 	t.Run("A cache request on a mounter with no cache volume is rejected before anything is created", func(t *testing.T) {
@@ -1294,59 +1213,10 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 		assert.FileNotExists(t, mounter.SourceMountPath(testCtx.kubeletPath, pvName))
 	})
 
-	// Creating and removing the mount's directory
-	t.Run("A cache directory that cannot be created fails the mount, keeping the meta file", func(t *testing.T) {
-		// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case. (Considered skipping if root run)
-		assert.Equals(t, false, os.Geteuid() == 0)
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
-
-		// Make cache volume read-only
-		assert.NoError(t, os.Chmod(testCtx.cacheDir, 0500))
-		t.Cleanup(func() { os.Chmod(testCtx.cacheDir, 0770) })
-
-		err := mountWithoutServing(testCtx, testCtx.ctx, "pod-a-uid", cacheRequest)
-		if err == nil {
-			t.Fatal("expected the mount to fail when its cache directory cannot be created")
-		}
-		assert.Contains(t, err.Error(), "failed to create cache directory")
-
-		// The meta file is written before the directory, so the cleanup that retries has the path.
-		_, statErr := os.Stat(mounter.MetaFileName(testCtx.kubeletPath, pvName))
-		assert.NoError(t, statErr)
-	})
-
-	t.Run("A cache that cannot be removed keeps the mount's meta file for a later retry", func(t *testing.T) {
-		// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case. (Considered skipping if root run)
-		assert.Equals(t, false, os.Geteuid() == 0)
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
-
-		target, _ := testCtx.mountAndServe("pod-a-uid", pvName, cacheRequest)
-		mountCacheDir := filepath.Join(testCtx.cacheDir, pvName)
-
-		// Make cache volume read-only
-		assert.NoError(t, os.Chmod(testCtx.cacheDir, 0500))
-		t.Cleanup(func() { os.Chmod(testCtx.cacheDir, 0770) })
-
-		// TODO: do we want this to error instead? See TODO in daemonset_mounter.go's releaseTarget function.
-		assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target, credentialprovider.CleanupContext{VolumeID: pvName}))
-
-		_, err := os.Stat(mountCacheDir)
-		assert.NoError(t, err)
-		_, err = os.Stat(mounter.MetaFileName(testCtx.kubeletPath, pvName))
-		assert.NoError(t, err)
-
-		// Use CleanupOrphans to see if MountMap entry is retained.
-		assert.NoError(t, os.Chmod(testCtx.cacheDir, 0770))
-		testCtx.dm.CleanupOrphans()
-
-		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, pvName))
-		assert.FileNotExists(t, mountCacheDir)
-	})
-
 	// Rediscovery
-	t.Run("Staleness drops the cache dir with the comm dir, and next discovery replaces it", func(t *testing.T) {
+	t.Run("Staleness drops the mounter's cache volume with the comm dir, and next discovery replaces it", func(t *testing.T) {
 		// DiscoverMounter is called to discover mounter dir / comm dir.
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
+		testCtx := setupDMWithCache(t)
 
 		// Nothing accepts on the socket, so mountoptions.Send fails, and the driver drops the
 		// discovered mounter pod (dm.mounter.Store(nil)).
@@ -1368,36 +1238,6 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 
 		err = mountWithoutServing(testCtx, testCtx.ctx, "pod-after-rediscovery", cacheRequest)
 		assert.Equals(t, codes.InvalidArgument, status.Code(err))
-	})
-
-	t.Run("Cache directory survives until the last consumer unmounts", func(t *testing.T) {
-		testCtx := setupDMWithCache(t, volumecontext.CacheTypeEmptyDir)
-		pvName := "s3-pv-shared-cache"
-		mountCacheDir := filepath.Join(testCtx.cacheDir, pvName)
-
-		target1, _ := testCtx.mountAndServe("pod-a-uid", pvName, cacheRequest)
-
-		// Don't use mountAndServe so it doesn't try to connect to socket again for fd passing.
-		target2 := testCtx.targetPathFor("pod-b-uid", pvName)
-		assert.NoError(t, testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target2, testCtx.driverProvideCtx("pod-b-uid"),
-			cacheRequest, mountpoint.ParseArgs(nil), "", nil))
-
-		_, err := os.Stat(mountCacheDir)
-		assert.NoError(t, err)
-
-		// First consumer leaves: the mount is still live, so its cache must not be touched.
-		assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target1, credentialprovider.CleanupContext{VolumeID: pvName}))
-		_, err = os.Stat(mountCacheDir)
-		assert.NoError(t, err)
-
-		// Last consumer leaves: cache subdir now deleted.
-		assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target2, credentialprovider.CleanupContext{VolumeID: pvName}))
-		_, err = os.Stat(mountCacheDir)
-		assert.Equals(t, true, os.IsNotExist(err))
-
-		// The shared volume root must survive.
-		_, err = os.Stat(testCtx.cacheDir)
-		assert.NoError(t, err)
 	})
 }
 

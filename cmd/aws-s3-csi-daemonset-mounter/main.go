@@ -53,6 +53,7 @@ var (
 			"max-volumes-per-node Mountpoints, or \"none\" to leave it to the PV mountOptions. Unset when it has none")
 	cacheMediumFlag = flag.String("cache-medium", "",
 		"The cache volume's emptyDir medium; \"Memory\" makes it a tmpfs charged to this container's memory")
+	cacheDir = flag.String("cache-dir", "", "The cache volume's mount path, or \"\" when this container has none")
 )
 
 const (
@@ -86,8 +87,8 @@ func main() {
 
 	// The chart passes --cache-limit-strategy only with a cache volume; without one no mount here caches, so there is nothing to limit.
 	cacheLimit := cacheLimit{strategy: cacheLimitNone}
-	if *cacheLimitStrategyFlag == "" && (cacheVolumeBytes > 0 || *cacheMediumFlag != "") {
-		klog.Fatalf("This container has a cache volume (%s or --cache-medium is set) but no --cache-limit-strategy", cacheCapacityEnvName)
+	if *cacheLimitStrategyFlag == "" && (*cacheDir != "" || cacheVolumeBytes > 0 || *cacheMediumFlag != "") {
+		klog.Fatalf("This container has a cache volume (--cache-dir, %s or --cache-medium is set) but no --cache-limit-strategy", cacheCapacityEnvName)
 	}
 	if *cacheLimitStrategyFlag != "" {
 		cacheLimitStrategy, err := parseCacheLimitStrategy(*cacheLimitStrategyFlag)
@@ -98,6 +99,11 @@ func main() {
 		if err != nil {
 			klog.Fatalf("Invalid Mountpoint cache configuration: %v", err)
 		}
+	}
+
+	pm := NewProcessManager(*commDir, *cacheDir, &defaultProcessRunner{stderrCapacity: *stderrCapacity}, memoryLimit, cacheLimit)
+	if err := pm.secureCacheRoot(); err != nil {
+		klog.Fatalf("Cannot isolate each mount's cache directory: %v", err)
 	}
 
 	sockPath := filepath.Join(*commDir, mountSockName)
@@ -113,8 +119,6 @@ func main() {
 	defer listener.Close()
 
 	klog.Infof("Listening on %s, mountpoint binary: %s", sockPath, mountpointPath)
-
-	pm := NewProcessManager(*commDir, &defaultProcessRunner{stderrCapacity: *stderrCapacity}, memoryLimit, cacheLimit)
 
 	// Handle shutdown signals: terminate all MP processes gracefully
 	sigCh := make(chan os.Signal, 1)
