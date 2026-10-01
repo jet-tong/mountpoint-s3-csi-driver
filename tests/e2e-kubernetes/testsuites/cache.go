@@ -14,6 +14,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -97,25 +98,25 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 		seed := time.Now().UTC().UnixNano()
 		testWriteSize := 1024 // 1KB
 
-		checkWriteToPath(ctx, f, pod, first, testWriteSize, seed)
+		checkWriteToPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 		checkListingPathWithEntries(ctx, f, pod, basePath, []string{"first"})
 		// Test reading multiple times to ensure cached-read works
 		for range 3 {
-			checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+			checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 		}
 
 		// Now remove the file from S3
 		deleteObjectFromS3(ctx, bucketName, "first")
 
 		// Ensure the data still read from the cache - without cache this would fail as its removed from underlying bucket
-		checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+		checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 
-		e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("mkdir %s && cd %s && echo 'second!' > %s; sync", dir, dir, second))
-		e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("cat %s | grep -q 'second!'", second))
+		checkExecInPodSucceed(ctx, f, pod, fmt.Sprintf("mkdir %s && cd %s && echo 'second!' > %s; sync", dir, dir, second))
+		checkExecInPodSucceed(ctx, f, pod, fmt.Sprintf("cat %s | grep -q 'second!'", second))
 		checkListingPathWithEntries(ctx, f, pod, dir, []string{"second"})
 		checkListingPathWithEntries(ctx, f, pod, basePath, []string{"test-dir"})
-		checkDeletingPath(ctx, f, pod, first)
-		checkDeletingPath(ctx, f, pod, second)
+		checkDeletingPathSucceed(ctx, f, pod, first)
+		checkDeletingPathSucceed(ctx, f, pod, second)
 	}
 
 	createPod := func(ctx context.Context, mountOptions []string, podModifiers ...func(*v1.Pod)) (*v1.Pod, string) {
@@ -175,7 +176,7 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 					})
 				}
 			case localCacheEBSEphemeral:
-				scName := createEBSCacheSC(ctx, f)
+				scName := createEBSCacheSC(ctx, f, f.UniqueName+"-sc")
 				enhanceContext = func(ctx context.Context) context.Context {
 					return contextWithVolumeAttributes(ctx, map[string]string{
 						"cache":                                "ephemeral",
@@ -244,7 +245,7 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 			})
 
 			pod, _ := createPod(ctx, mountOptions, podModifiers...)
-			e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("cat %s | grep -q 'hello world!'", testFile))
+			checkExecInPodSucceed(ctx, f, pod, fmt.Sprintf("cat %s | grep -q 'hello world!'", testFile))
 		})
 
 		// If we're testing multi-level cache, add two more test cases:
@@ -267,19 +268,19 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 
 				first := filepath.Join(e2epod.VolumeMountPath1, "first")
 
-				checkWriteToPath(ctx, f, pod, first, testWriteSize, seed)
+				checkWriteToPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				// Initial read should work and populate both local and Express cache
 				for range 3 {
-					checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+					checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				}
 
 				// Now remove the file from S3 and wipe out local cache
 				deleteObjectFromS3(ctx, bucketName, "first")
-				e2epod.VerifyExecInPodSucceed(ctx, f, pod, "rm -rf /cache/*")
+				checkExecInPodSucceed(ctx, f, pod, "rm -rf /cache/*")
 
 				// Reading should still work
 				for range 3 {
-					checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+					checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				}
 			})
 
@@ -299,10 +300,10 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 
 				first := filepath.Join(e2epod.VolumeMountPath1, "first")
 
-				checkWriteToPath(ctx, f, pod, first, testWriteSize, seed)
+				checkWriteToPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				// Initial read should work and populate both local and Express cache
 				for range 3 {
-					checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+					checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				}
 
 				// Now remove the file from S3 and wipe out Express cache
@@ -311,7 +312,7 @@ func (t *s3CSICacheTestSuite) DefineTests(driver storageframework.TestDriver, pa
 
 				// Reading should still work
 				for range 3 {
-					checkReadFromPath(ctx, f, pod, first, testWriteSize, seed)
+					checkReadFromPathSucceed(ctx, f, pod, first, testWriteSize, seed)
 				}
 			})
 		}
@@ -394,9 +395,8 @@ func randomCacheDir() string {
 
 // createEBSCacheSC creates a StorageClass to provision an EBS volume as local-cache.
 // It automatically cleans up SC after the test-case.
-func createEBSCacheSC(ctx context.Context, f *framework.Framework) string {
-	scName := f.UniqueName + "-sc"
-
+// Note: Also used in cache_daemonset.go
+func createEBSCacheSC(ctx context.Context, f *framework.Framework, scName string) string {
 	sc := &storagev1.StorageClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: scName,
@@ -410,13 +410,18 @@ func createEBSCacheSC(ctx context.Context, f *framework.Framework) string {
 	}
 
 	framework.Logf("Creating StorageClass %s with EBS CSI Driver provisioner", scName)
+	// A fixed name can meet one leaked by an interrupted run.
 	_, err := f.ClientSet.StorageV1().StorageClasses().Create(ctx, sc, metav1.CreateOptions{})
-	framework.ExpectNoError(err, "Failed to create StorageClass for cache")
+	if !apierrors.IsAlreadyExists(err) {
+		framework.ExpectNoError(err, "Failed to create StorageClass for cache")
+	}
 
 	DeferCleanup(func(ctx context.Context) {
 		framework.Logf("Deleting StorageClass %s", scName)
 		err := f.ClientSet.StorageV1().StorageClasses().Delete(ctx, scName, metav1.DeleteOptions{})
-		framework.ExpectNoError(err, "Failed to delete StorageClass for cache")
+		if !apierrors.IsNotFound(err) {
+			framework.ExpectNoError(err, "Failed to delete StorageClass for cache")
+		}
 	})
 
 	return scName

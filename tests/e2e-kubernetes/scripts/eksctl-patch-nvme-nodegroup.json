@@ -1,0 +1,42 @@
+[
+  {
+    "op": "copy",
+    "from": "/managedNodeGroups/0",
+    "path": "/managedNodeGroups/-"
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/name",
+    "value": "ng-nvme"
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/labels/alpha.eksctl.io~1nodegroup-name",
+    "value": "ng-nvme"
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/tags/alpha.eksctl.io~1nodegroup-name",
+    "value": "ng-nvme"
+  },
+  {
+    "op": "add",
+    "path": "/managedNodeGroups/1/labels/s3.csi.aws.com~1local-nvme",
+    "value": "true"
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/desiredCapacity",
+    "value": 1
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/minSize",
+    "value": 1
+  },
+  {
+    "op": "replace",
+    "path": "/managedNodeGroups/1/maxSize",
+    "value": 1
+  }
+]

@@ -102,7 +102,7 @@ func NewPodMounter(
 //
 // If Mountpoint is already mounted at `target`, it will return early at step 3 to ensure credentials are up-to-date.
 // If Mountpoint is already mounted at `source`, it will skip steps 4-7 and only perform bind mount to `target`.
-func (pm *PodMounter) Mount(ctx context.Context, bucketName string, target string, credentialCtx credentialprovider.ProvideContext, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error {
+func (pm *PodMounter) Mount(ctx context.Context, bucketName string, target string, credentialCtx credentialprovider.ProvideContext, volumeCtx map[string]string, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error {
 	volumeName, err := pm.volumeNameFromTargetPath(target)
 	if err != nil {
 		return fmt.Errorf("Failed to extract volume name from %q: %w", target, err)
@@ -234,12 +234,6 @@ func (pm *PodMounter) mountS3AtSource(ctx context.Context, source string, mpPod 
 	if err != nil {
 		klog.Errorf("Failed to mount %s: %v", source, err)
 		return fmt.Errorf("Failed to mount %s: %w", source, err)
-	}
-
-	// Remove the read-only argument from the list as mount-s3 does not support it when using FUSE
-	// file descriptor (we already pass MS_RDONLY flag during mount syscall in `pod_mounter_linux.go`)
-	if args.Has(mountpoint.ArgReadOnly) {
-		args.Remove(mountpoint.ArgReadOnly)
 	}
 
 	// This will set to false in the success condition. This is set to `true` by default to

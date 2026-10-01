@@ -35,7 +35,7 @@ SELINUX_MODE=${SELINUX_MODE:-}
 
 # eksctl: mustn't include patch version (e.g. 1.19)
 # 'K8S_VERSION' variable must be a full version (e.g. 1.19.1)
-K8S_VERSION=${K8S_VERSION:-1.30.4}
+K8S_VERSION=${K8S_VERSION:-1.31.0}
 K8S_VERSION_EKSCTL=${K8S_VERSION_EKSCTL:-${K8S_VERSION%.*}}
 
 # We need to ensure that we're using all testing matrix variables in the cluster name
@@ -55,11 +55,15 @@ KUBECONFIG=${KUBECONFIG:-"${TEST_DIR}/${CLUSTER_NAME}.kubeconfig"}
 ZONES=${AWS_AVAILABILITY_ZONES:-$(aws ec2 describe-availability-zones --region ${REGION} | jq -c '.AvailabilityZones[].ZoneName' | grep -v "us-east-1e" | tr '\n' ',' | sed 's/"//g' | sed 's/.$//')} # excluding us-east-1e, see: https://github.com/eksctl-io/eksctl/issues/817
 NODE_COUNT=${NODE_COUNT:-3}
 if [[ "${ARCH}" == "x86" ]]; then
-  INSTANCE_TYPE_DEFAULT=c5.large
+  INSTANCE_TYPE_DEFAULT=c5.xlarge
+  NVME_INSTANCE_TYPE_DEFAULT=m5d.large
 else
   INSTANCE_TYPE_DEFAULT=m7g.large
+  NVME_INSTANCE_TYPE_DEFAULT=m6gd.large
 fi
 INSTANCE_TYPE=${INSTANCE_TYPE:-$INSTANCE_TYPE_DEFAULT}
+# One node with an instance-store disk, for the cache suite's NVMe row: the cheapest with one and room for the mounter's 4Gi request.
+NVME_INSTANCE_TYPE=${NVME_INSTANCE_TYPE:-$NVME_INSTANCE_TYPE_DEFAULT}
 CLUSTER_FILE=${TEST_DIR}/${CLUSTER_NAME}.${CLUSTER_TYPE}.yaml
 
 SSH_KEY=${SSH_KEY:-""}
@@ -67,6 +71,7 @@ HELM_RELEASE_NAME=mountpoint-s3-csi-driver
 
 EKSCTL_PATCH_FILE=${EKSCTL_PATCH_FILE:-${BASE_DIR}/eksctl-patch.json}
 EKSCTL_PATCH_SELINUX_ENFORCING_FILE=${EKSCTL_PATCH_SELINUX_ENFORCING_FILE:-${BASE_DIR}/eksctl-patch-selinux-enforcing.json}
+EKSCTL_PATCH_NVME_NODEGROUP_FILE=${EKSCTL_PATCH_NVME_NODEGROUP_FILE:-${BASE_DIR}/eksctl-patch-nvme-nodegroup.json}
 if [[ "${SELINUX_MODE}" != "enforcing" ]]; then
     EKSCTL_PATCH_SELINUX_ENFORCING_FILE=""
 fi
@@ -98,7 +103,7 @@ function install_tools() {
 
   eksctl_install "${BIN_DIR}"
 
-  go install github.com/onsi/ginkgo/v2/ginkgo
+  (cd "${BASE_DIR}/.." && go install github.com/onsi/ginkgo/v2/ginkgo)
 }
 
 function create_cluster() {
@@ -116,7 +121,9 @@ function create_cluster() {
       "$INSTANCE_TYPE" \
       "$AMI_FAMILY" \
       "$K8S_VERSION_EKSCTL" \
-      "$EKSCTL_PATCH_SELINUX_ENFORCING_FILE"
+      "$EKSCTL_PATCH_SELINUX_ENFORCING_FILE" \
+      "$EKSCTL_PATCH_NVME_NODEGROUP_FILE" \
+      "$NVME_INSTANCE_TYPE"
   fi
 }
 
