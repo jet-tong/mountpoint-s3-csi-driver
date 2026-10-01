@@ -10,12 +10,6 @@ import (
 	"flag"
 	"os"
 
-	"github.com/awslabs/mountpoint-s3-csi-driver/cmd/aws-s3-csi-controller/csicontroller"
-	crdv2 "github.com/awslabs/mountpoint-s3-csi-driver/pkg/api/v2"
-	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/cluster"
-	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/version"
-	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/podmounter/mppod"
-	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -25,9 +19,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+
+	"github.com/awslabs/mountpoint-s3-csi-driver/cmd/aws-s3-csi-controller/csicontroller"
+	crdv2 "github.com/awslabs/mountpoint-s3-csi-driver/pkg/api/v2"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/cluster"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/version"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/podmounter/mppod"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 var mountpointNamespace = flag.String("mountpoint-namespace", os.Getenv("MOUNTPOINT_NAMESPACE"), "Namespace to spawn Mountpoint Pods in.")
+var mounterMode = flag.String("mounter-mode", os.Getenv("MOUNTER_MODE"), `Mounter mode. When "daemonset" (V3), the controller runs in drain-only mode and never spawns Pods.`)
 var mountpointVersion = flag.String("mountpoint-version", os.Getenv("MOUNTPOINT_VERSION"), "Version of Mountpoint within the given Mountpoint image.")
 var mountpointPriorityClassName = flag.String("mountpoint-priority-class-name", os.Getenv("MOUNTPOINT_PRIORITY_CLASS_NAME"), "Priority class name of the Mountpoint Pods.")
 var mountpointPreemptingPriorityClassName = flag.String("mountpoint-preempting-priority-class-name", os.Getenv("MOUNTPOINT_PREEMPTING_PRIORITY_CLASS_NAME"), "Preempting priority class name of the Mountpoint Pods.")
@@ -56,10 +58,13 @@ func main() {
 	log := logf.Log.WithName(csicontroller.Name)
 	conf := config.GetConfigOrDie()
 
-	mgrOpts := manager.Options{Scheme: scheme}
-	csicontroller.ConfigureLeaderElection(&mgrOpts)
-
-	mgr, err := manager.New(conf, mgrOpts)
+	mgr, err := manager.New(conf, manager.Options{
+		Scheme:                        scheme,
+		LeaderElection:                true,
+		LeaderElectionID:              "aws-s3-csi-controller",
+		LeaderElectionResourceLock:    "leases",
+		LeaderElectionReleaseOnCancel: true,
+	})
 	if err != nil {
 		log.Error(err, "Failed to create a new manager")
 		os.Exit(1)
@@ -68,6 +73,26 @@ func main() {
 	if err := crdv2.SetupManagerIndices(mgr); err != nil {
 		log.Error(err, "Failed to setup field indexers")
 		os.Exit(1)
+	}
+
+	// In daemonset (V3) mounter mode the controller runs in drain-only mode: a single periodic
+	// cleaner drains the lifecycle of existing V2 Mountpoint Pods (prunes stale S3PA attachments,
+	// deletes completed Mountpoint Pods, removes leftover Headroom Pods) but never spawns new ones.
+	// This path needs only an API client — no Mountpoint Pod config (images, priority classes, etc.).
+	if *mounterMode == "daemonset" {
+		log.Info("Running controller in drain-only mode (daemonset mounter)")
+
+		cleaner := csicontroller.NewDrainStaleAttachmentCleaner(mgr.GetClient(), *mountpointNamespace)
+		if err := cleaner.SetupWithManager(mgr); err != nil {
+			log.Error(err, "Failed to add drain-only stale attachment cleaner to manager")
+			os.Exit(1)
+		}
+
+		if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
+			log.Error(err, "Failed to start manager")
+			os.Exit(1)
+		}
+		return
 	}
 
 	podLabels := util.ParseLabels(*mountpointPodLabels, log)

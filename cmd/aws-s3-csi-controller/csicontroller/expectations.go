@@ -5,7 +5,6 @@ import (
 	"strings"
 	"sync"
 
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -21,10 +20,11 @@ func newExpectations() *expectations {
 	return &expectations{}
 }
 
-// setPending records the UID of the resource expected for the given field filters.
-func (e *expectations) setPending(fieldFilters client.MatchingFields, uid types.UID) {
+// setPending marks a resource as pending based on the given field filters.
+// This is typically used when a create operation is initiated.
+func (e *expectations) setPending(fieldFilters client.MatchingFields) {
 	key := deriveExpectationKeyFromFilters(fieldFilters)
-	e.pending.Store(key, uid)
+	e.pending.Store(key, struct{}{})
 }
 
 // isPending checks if a resource is marked as pending based on the given field filters.
@@ -40,12 +40,6 @@ func (e *expectations) isPending(fieldFilters client.MatchingFields) bool {
 func (e *expectations) clear(fieldFilters client.MatchingFields) {
 	key := deriveExpectationKeyFromFilters(fieldFilters)
 	e.pending.Delete(key)
-}
-
-// clearIfObserved clears only the expectation for the observed resource, so stale snapshots cannot clear a replacement's expectation.
-func (e *expectations) clearIfObserved(fieldFilters client.MatchingFields, uid types.UID) bool {
-	key := deriveExpectationKeyFromFilters(fieldFilters)
-	return e.pending.CompareAndDelete(key, uid)
 }
 
 // deriveExpectationKeyFromFilters generates a deterministic string key from a map of field filters.

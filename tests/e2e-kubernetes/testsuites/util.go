@@ -185,6 +185,43 @@ func bucketNameFromVolumeResource(vol *storageframework.VolumeResource) string {
 	return pvc.CSI.VolumeHandle
 }
 
+// createPVReusingHandle creates a second PV/PVC that reuses src's CSI source — the same
+// volumeHandle (bucket) under a new PV name. It creates no new bucket, so src must outlive it.
+// Used to exercise per-node volumeHandle uniqueness with two distinct PVs sharing one handle.
+func createPVReusingHandle(ctx context.Context, f *framework.Framework, src *storageframework.VolumeResource) (*v1.PersistentVolume, *v1.PersistentVolumeClaim) {
+	pvName := "s3-e2e-pv-" + uuid.New().String()
+	pvcName := "s3-e2e-pvc-" + uuid.New().String()
+	emptyStorageClass := ""
+
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvName},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: src.Pv.Spec.PersistentVolumeSource, // same volumeHandle as src
+			StorageClassName:       "",
+			MountOptions:           src.Pv.Spec.MountOptions,
+			AccessModes:            src.Pv.Spec.AccessModes,
+			Capacity:               v1.ResourceList{v1.ResourceStorage: resource.MustParse("1200Gi")},
+			ClaimRef:               &v1.ObjectReference{Name: pvcName, Namespace: f.Namespace.Name},
+		},
+	}
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: f.Namespace.Name},
+		Spec: v1.PersistentVolumeClaimSpec{
+			StorageClassName: &emptyStorageClass,
+			VolumeName:       pvName,
+			AccessModes:      src.Pv.Spec.AccessModes,
+			Resources:        v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceStorage: resource.MustParse("1200Gi")}},
+		},
+	}
+
+	pv, err := f.ClientSet.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create duplicate-handle PV")
+	pvc, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create duplicate-handle PVC")
+	framework.ExpectNoError(e2epv.WaitOnPVandPVC(ctx, f.ClientSet, f.Timeouts, f.Namespace.Name, pv, pvc), "duplicate-handle PV/PVC failed to bind")
+	return pv, pvc
+}
+
 func createPodWithoutWaiting(ctx context.Context, client clientset.Interface, namespace string, pod *v1.Pod) (*v1.Pod, error) {
 	serviceAccount := pod.Spec.ServiceAccountName
 	if serviceAccount == "" {
@@ -382,4 +419,70 @@ func findMountpointPods(ctx context.Context, cs clientset.Interface, volumeName 
 	}
 
 	return matchingPods, nil
+}
+
+// isDaemonsetMounterMode returns true if the cluster has daemonset mounter pods running,
+// indicating the driver is deployed in daemonset architecture mode.
+func isDaemonsetMounterMode(ctx context.Context, f *framework.Framework) bool {
+	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=s3-csi-daemonset-mounter",
+	})
+	if err != nil {
+		return false
+	}
+	return len(pods.Items) > 0
+}
+
+// checkReadFromPathSucceedEventually retries reading from a path in a pod, tolerating
+// transient errors
+func checkReadFromPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	sum := sha256.Sum256(genBinDataFromSeed(toWrite, seed))
+	cmd := fmt.Sprintf("dd if=%s bs=%d count=1 | sha256sum | grep -Fq %x", path, toWrite, sum)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkWriteToPathSucceedEventually retries writing to a path in a pod, tolerating
+// transient errors
+func checkWriteToPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd conv=fsync of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathSucceedEventually retries listing a path in a pod, tolerating
+// transient errors
+func checkListingPathSucceedEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodSucceed(ctx, f, pod, cmd)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+}
+
+// checkListingPathWithEntriesEventually retries listing a path and verifying its entries,
+// tolerating transient errors
+func checkListingPathWithEntriesEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, entries []string) {
+	cmd := fmt.Sprintf("ls %s", path)
+	gomega.Eventually(ctx, func(ctx context.Context) ([]string, error) {
+		stdout, stderr, err := e2epod.ExecShellInPodWithFullOutput(ctx, f, pod.Name, cmd)
+		if err != nil {
+			return nil, fmt.Errorf("%q failed: %v\nstdout: %s\nstderr: %s", cmd, err, stdout, stderr)
+		}
+		return strings.Fields(stdout), nil
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Equal(entries))
+}
+
+// checkWriteToPathFailsEventually retries verifying that a write to a path fails with exit code 1,
+// tolerating transient errors
+func checkWriteToPathFailsEventually(ctx context.Context, f *framework.Framework, pod *v1.Pod, path string, toWrite int, seed int64) {
+	data := genBinDataFromSeed(toWrite, seed)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	cmd := fmt.Sprintf("echo %s | base64 -d | dd of=%s bs=%d count=1", encoded, path, toWrite)
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return e2epod.VerifyExecInPodFail(ctx, f, pod, cmd, 1)
+	}).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
 }

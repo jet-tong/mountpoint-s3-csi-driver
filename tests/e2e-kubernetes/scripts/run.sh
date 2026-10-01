@@ -55,11 +55,15 @@ KUBECONFIG=${KUBECONFIG:-"${TEST_DIR}/${CLUSTER_NAME}.kubeconfig"}
 ZONES=${AWS_AVAILABILITY_ZONES:-$(aws ec2 describe-availability-zones --region ${REGION} | jq -c '.AvailabilityZones[].ZoneName' | grep -v "us-east-1e" | tr '\n' ',' | sed 's/"//g' | sed 's/.$//')} # excluding us-east-1e, see: https://github.com/eksctl-io/eksctl/issues/817
 NODE_COUNT=${NODE_COUNT:-3}
 if [[ "${ARCH}" == "x86" ]]; then
-  INSTANCE_TYPE_DEFAULT=c5.large
+  INSTANCE_TYPE_DEFAULT=c5.xlarge
+  NVME_INSTANCE_TYPE_DEFAULT=m5d.large
 else
   INSTANCE_TYPE_DEFAULT=m7g.large
+  NVME_INSTANCE_TYPE_DEFAULT=m6gd.large
 fi
 INSTANCE_TYPE=${INSTANCE_TYPE:-$INSTANCE_TYPE_DEFAULT}
+# One node with an instance-store disk, for the cache suite's NVMe row: the cheapest with one and room for the mounter's 4Gi request.
+NVME_INSTANCE_TYPE=${NVME_INSTANCE_TYPE:-$NVME_INSTANCE_TYPE_DEFAULT}
 CLUSTER_FILE=${TEST_DIR}/${CLUSTER_NAME}.${CLUSTER_TYPE}.yaml
 
 SSH_KEY=${SSH_KEY:-""}
@@ -67,6 +71,7 @@ HELM_RELEASE_NAME=mountpoint-s3-csi-driver
 
 EKSCTL_PATCH_FILE=${EKSCTL_PATCH_FILE:-${BASE_DIR}/eksctl-patch.json}
 EKSCTL_PATCH_SELINUX_ENFORCING_FILE=${EKSCTL_PATCH_SELINUX_ENFORCING_FILE:-${BASE_DIR}/eksctl-patch-selinux-enforcing.json}
+EKSCTL_PATCH_NVME_NODEGROUP_FILE=${EKSCTL_PATCH_NVME_NODEGROUP_FILE:-${BASE_DIR}/eksctl-patch-nvme-nodegroup.json}
 if [[ "${SELINUX_MODE}" != "enforcing" ]]; then
     EKSCTL_PATCH_SELINUX_ENFORCING_FILE=""
 fi
@@ -116,7 +121,9 @@ function create_cluster() {
       "$INSTANCE_TYPE" \
       "$AMI_FAMILY" \
       "$K8S_VERSION_EKSCTL" \
-      "$EKSCTL_PATCH_SELINUX_ENFORCING_FILE"
+      "$EKSCTL_PATCH_SELINUX_ENFORCING_FILE" \
+      "$EKSCTL_PATCH_NVME_NODEGROUP_FILE" \
+      "$NVME_INSTANCE_TYPE"
   fi
 }
 

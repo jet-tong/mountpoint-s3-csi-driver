@@ -131,16 +131,27 @@ delete_eks_cluster() {
 
 deploy_helm_chart() {
     local ecr_repository_url=$(get_ecr_repository_url)
+    local mounterMode="${MOUNTPOINT_CSI_MOUNTER_MODE:-daemonset}" # or pod
+    local cacheSizeLimit="${MOUNTPOINT_CSI_DEV_CACHE_SIZE_LIMIT:-2Gi}"
 
-    echo "deploying Helm chart..."
+    echo "deploying Helm chart (mounterMode=${mounterMode}, cache sizeLimit=${cacheSizeLimit})..."
+    # --values is load-bearing: `--set daemonsetMounters[0].<field>` replaces the whole list element,
+    # so without it maxVolumesPerNode, resources and logLevel are all lost and the render fails.
     helm upgrade --install aws-mountpoint-s3-csi-driver \
         --namespace kube-system \
+        --values ./charts/aws-mountpoint-s3-csi-driver/values.yaml \
         --set unsupportedDevInstall=true \
         --set image.repository="${ecr_repository_url}" \
         --set image.pullPolicy=Always \
         --set image.tag=latest \
+        --set experimental.mounterMode="${mounterMode}" \
         --set experimental.dynamicVolumeProvisioningFromExistingBucket=true \
+        --set daemonsetMounters[0].cache.emptyDir.sizeLimit="${cacheSizeLimit}" \
+        --set daemonsetMounters[0].cache.cacheLimitStrategy=equalSplit \
         ./charts/aws-mountpoint-s3-csi-driver
+
+    # Restart the mounter DS pod (OnDelete strategy means helm upgrade alone won't recreate it)
+    kubectl -n kube-system delete po -lapp=s3-csi-daemonset-mounter --ignore-not-found
 }
 
 deploy_containers() {
@@ -180,9 +191,11 @@ deploy_containers() {
     FORCE_BUILD=true \
       make login_registry all-push
 
-    # Restart the node and controller pods
-    kubectl -n kube-system delete po -lapp=s3-csi-controller
+    # Restart the node, controller and mounter daemonset pod
+    # Note pod mode has controller and no mounter daemonset, vice versa in daemonset mode
+    kubectl -n kube-system delete po -lapp=s3-csi-controller --ignore-not-found
     kubectl -n kube-system delete po -lapp=s3-csi-node
+    kubectl -n kube-system delete po -lapp=s3-csi-daemonset-mounter --ignore-not-found
 }
 
 deploy() {

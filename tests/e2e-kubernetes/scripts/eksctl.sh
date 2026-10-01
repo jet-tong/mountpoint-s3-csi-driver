@@ -65,6 +65,8 @@ function eksctl_create_cluster() {
   AMI_FAMILY=${11}
   K8S_VERSION=${12}
   EKSCTL_PATCH_SELINUX_ENFORCING_FILE=${13}
+  EKSCTL_PATCH_NVME_NODEGROUP_FILE=${14}
+  NVME_INSTANCE_TYPE=${15}
 
   CLUSTER_SPEC_HASH=$(eksctl_compute_cluster_spec_hash "${NODE_TYPE}" "${ZONES}" "${EKSCTL_PATCH_SELINUX_ENFORCING_FILE}")
 
@@ -102,6 +104,12 @@ function eksctl_create_cluster() {
     ${KUBECTL_BIN} patch -f $CLUSTER_FILE --local --type json --patch "$(cat $EKSCTL_PATCH_SELINUX_ENFORCING_FILE)" -o yaml > $CLUSTER_FILE_TMP
     mv $CLUSTER_FILE_TMP $CLUSTER_FILE
   fi
+
+  # Last, so the nodegroup it copies from the first one already carries the patches above.
+  NVME_NODEGROUP_PATCH=$(jq --arg type "${NVME_INSTANCE_TYPE}" \
+    '. + [{"op": "replace", "path": "/managedNodeGroups/1/instanceType", "value": $type}]' "${EKSCTL_PATCH_NVME_NODEGROUP_FILE}")
+  ${KUBECTL_BIN} patch -f $CLUSTER_FILE --local --type json --patch "${NVME_NODEGROUP_PATCH}" -o yaml > $CLUSTER_FILE_TMP
+  mv $CLUSTER_FILE_TMP $CLUSTER_FILE
 
   ${BIN} create cluster -f "${CLUSTER_FILE}" --kubeconfig "${KUBECONFIG}"
 

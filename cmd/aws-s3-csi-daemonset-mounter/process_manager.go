@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -25,17 +26,22 @@ const errorFileExt = ".error"
 
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
-	commDir   string
-	runner    ProcessRunner // interface for spawning processes; substituted in tests
+	commDir string
+	runner  ProcessRunner // interface for spawning processes; substituted in tests
+	memory  memoryLimit
+	cache   cacheLimit
+
 	mu        sync.Mutex
 	processes map[string]ProcessHandle // mountId -> process handle
 	wg        sync.WaitGroup           // tracks waiter goroutines
 }
 
-func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
+func NewProcessManager(commDir string, runner ProcessRunner, memory memoryLimit, cache cacheLimit) *ProcessManager {
 	return &ProcessManager{
 		commDir:   commDir,
 		runner:    runner,
+		memory:    memory,
+		cache:     cache,
 		processes: make(map[string]ProcessHandle),
 	}
 }
@@ -52,6 +58,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	args := mountpoint.ParseArgs(options.Args)
 	args.Set(mountpoint.ArgForeground, mountpoint.ArgNoValue)
 
+	if targetMiB := pm.memory.targetFor(mountId, args); targetMiB > 0 {
+		args.Set(mountpoint.ArgMemoryTarget, strconv.FormatInt(targetMiB, 10))
+	}
+	if sizeMiB, ok := pm.cache.maxCacheSizeFor(mountId, args); ok {
+		args.Set(mountpoint.ArgMaxCacheSize, strconv.FormatInt(sizeMiB, 10))
+	}
+
 	cmdArgs := append([]string{
 		options.BucketName,
 		"/dev/fd/3", // ExtraFiles[0] becomes fd 3
@@ -59,10 +72,6 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	cmd := exec.Command(mountpointPath, cmdArgs...)
 	cmd.ExtraFiles = []*os.File{fuseDev}
-
-	// TODO: we might need to make the child to inherit credentials ENV from this process (for driver-level creds)
-	// e.g. AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE,
-	//      AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
 
 	cmd.Env = options.Env
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
@@ -101,10 +110,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
-			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
-			if writeErr := os.WriteFile(errPath, stderr, errorFilePerm); writeErr != nil {
-				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
-			}
+			pm.writeErrorFile(mountId, stderr)
 			klog.Errorf("Mountpoint for mount %s exited with code %d", mountId, exitCode)
 		} else {
 			klog.Infof("Mountpoint for mount %s exited cleanly", mountId)
@@ -112,6 +118,16 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	}()
 
 	return nil
+}
+
+// writeErrorFile reports a mount failure to the driver, whose waitForMount polls for this file — the
+// only reply channel on the otherwise one-way mount socket.
+func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
+	errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+	// TODO(vlaad): write error file atomically (open,write,rename)
+	if err := os.WriteFile(errPath, content, errorFilePerm); err != nil {
+		klog.Errorf("Failed to write error file for mount %s: %v", mountId, err)
+	}
 }
 
 // Shutdown sends SIGTERM to all processes and waits for them to exit.
@@ -171,7 +187,9 @@ func (pm *ProcessManager) LogStatusPeriodically(interval time.Duration) {
 		actual := countChildProcesses()
 		openFDs := countOpenFDs()
 		goroutines := runtime.NumGoroutine()
-		klog.Infof("Status: tracked=%d actual_children=%d open_fds=%d goroutines=%d mounts=%v", tracked, actual, openFDs, goroutines, mountIds)
+		klog.Infof("Status: tracked=%d actual_children=%d open_fds=%d goroutines=%d memory_limit_strategy=%s share_mib=%d cache_limit_strategy=%s cache_share_mib=%d mounts=%v",
+			tracked, actual, openFDs, goroutines, pm.memory.strategy, pm.memory.shareMiB,
+			pm.cache.strategy, pm.cache.shareMiB, mountIds)
 	}
 }
 
