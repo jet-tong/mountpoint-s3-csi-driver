@@ -525,6 +525,18 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		assert.Equals(t, 0, len(fr.handles))
 	})
 
+	t.Run("refuses any mount, uncached too, while the cache volume cannot be read", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm := NewProcessManager(t.TempDir(), filepath.Join(t.TempDir(), "missing"), fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+		dev := mountertest.OpenDevNull(t)
+
+		err := pm.Launch(mountId, "/usr/bin/mount-s3", mountoptions.Options{Uid: 65536, Gid: 65536, Fd: int(dev.Fd()), BucketName: "my-bucket"})
+		if err == nil {
+			t.Fatal("expected Launch to refuse an uncached mount while the cache volume cannot be read")
+		}
+		assert.Equals(t, 0, len(fr.handles))
+	})
+
 	t.Run("fails without starting Mountpoint when its directory cannot be handed to the UID, and releases the mount", func(t *testing.T) {
 		fr := &fakeProcessRunner{}
 		pm, _, rec := newCachingProcessManager(t, fr, cacheLimit{strategy: cacheLimitNone})
@@ -725,6 +737,41 @@ func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
 
 	fr.handles[1].Exit(0, "")
 	pm.Shutdown()
+}
+
+func TestCheckCacheEntriesNotOwnedBy(t *testing.T) {
+	me := uint32(os.Getuid())
+	newVolume := func(t *testing.T, entries ...string) string {
+		dir := t.TempDir()
+		for _, e := range entries {
+			assert.NoError(t, os.Mkdir(filepath.Join(dir, e), 0700))
+		}
+		return dir
+	}
+
+	t.Run("passes a UID that owns nothing in the cache volume", func(t *testing.T) {
+		assert.NoError(t, checkCacheEntriesNotOwnedBy(newVolume(t, "other-pv"), "this-pv", false, me+1))
+	})
+	t.Run("passes a cached launch over its own leftover, which it replaces", func(t *testing.T) {
+		assert.NoError(t, checkCacheEntriesNotOwnedBy(newVolume(t, "this-pv"), "this-pv", true, me))
+	})
+	t.Run("refuses a UID that still owns another mount's directory, without naming it", func(t *testing.T) {
+		err := checkCacheEntriesNotOwnedBy(newVolume(t, "other-pv"), "this-pv", true, me)
+		if err == nil {
+			t.Fatal("expected a UID owning another mount's cache directory to be refused")
+		}
+		assert.Equals(t, fmt.Sprintf("UID %d still owns a cache directory", me), err.Error())
+	})
+	t.Run("refuses an uncached launch over its own leftover, which nothing replaces", func(t *testing.T) {
+		if err := checkCacheEntriesNotOwnedBy(newVolume(t, "this-pv"), "this-pv", false, me); err == nil {
+			t.Fatal("expected an uncached launch to be refused over a leftover its UID owns")
+		}
+	})
+	t.Run("fails when the cache volume cannot be read", func(t *testing.T) {
+		if err := checkCacheEntriesNotOwnedBy(filepath.Join(t.TempDir(), "missing"), "this-pv", false, me); err == nil {
+			t.Fatal("expected a missing cache volume to fail the check")
+		}
+	})
 }
 
 func TestRemoveCacheDir(t *testing.T) {

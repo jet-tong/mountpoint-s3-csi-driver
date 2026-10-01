@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -145,6 +146,15 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	// An earlier Mountpoint of this mount wrote it before freeing mountId, so it is not this launch's answer.
 	os.Remove(filepath.Join(pm.commDir, mountId+errorFileExt))
 
+	// Every child sees the cache volume, so none may run as a UID that still owns a directory there.
+	if pm.cacheDir != "" {
+		if err := checkCacheEntriesNotOwnedBy(pm.cacheDir, mountId, cached, options.Uid); err != nil {
+			pm.mu.Unlock()
+			fuseDev.Close()
+			return fmt.Errorf("refusing to launch mount %s: %w", mountId, err)
+		}
+	}
+
 	// After the duplicate check, so a relaunch cannot replace a directory a live Mountpoint is using.
 	if cached {
 		if err := pm.createCacheDir(mountId, options.Uid, options.Gid); err != nil {
@@ -201,6 +211,34 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		}
 	}()
 
+	return nil
+}
+
+// checkCacheEntriesNotOwnedBy refuses uid while it owns an entry in the cache volume, other than the one a cached
+// launch of mountId replaces.
+func checkCacheEntriesNotOwnedBy(cacheDir, mountId string, cached bool, uid uint32) error {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if cached && entry.Name() == mountId {
+			continue
+		}
+		fi, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // removed by an exiting mount's waiter since the ReadDir
+		}
+		if err != nil {
+			klog.Errorf("Cannot stat cache directory %q for mount %s: %v", entry.Name(), mountId, err)
+			return fmt.Errorf("cannot stat an entry of the cache volume: %w", errors.Unwrap(err))
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid == uid {
+			// Only the log names the directory, which may belong to another tenant's PV.
+			klog.Errorf("UID %d of mount %s still owns cache directory %q", uid, mountId, entry.Name())
+			return fmt.Errorf("UID %d still owns a cache directory", uid)
+		}
+	}
 	return nil
 }
 
