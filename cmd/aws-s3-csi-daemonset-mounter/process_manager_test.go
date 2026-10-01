@@ -954,6 +954,37 @@ func TestHandleConnection_MountIdValidation(t *testing.T) {
 	pm.Shutdown()
 }
 
+func TestHandleConnection_RefusedLaunchWritesErrorFile(t *testing.T) {
+	commDir := t.TempDir()
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(commDir, "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+	sockPath := filepath.Join(commDir, "test.sock")
+	listener, err := net.Listen("unix", sockPath)
+	assert.NoError(t, err)
+	defer listener.Close()
+
+	dev := mountertest.OpenDevNull(t)
+	// Waited on below, so the sender is done with dev before its cleanup closes it.
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		mountoptions.Send(ctx, sockPath, mountoptions.Options{Fd: int(dev.Fd()), BucketName: "bucket", VolumeId: "s3-pv"})
+	}()
+
+	conn, err := listener.Accept()
+	assert.NoError(t, err)
+	handleConnection(conn.(*net.UnixConn), "/opt/mount-s3", pm, 5*time.Second)
+	<-sendDone
+
+	errBytes, err := os.ReadFile(filepath.Join(commDir, "s3-pv.error"))
+	assert.NoError(t, err)
+	assert.Contains(t, string(errBytes), "out-of-range UID 0")
+	assert.Equals(t, 0, len(fr.handles))
+}
+
 func TestProcessManager_Launch_ErrorExit_WritesErrorFile(t *testing.T) {
 	commDir := t.TempDir()
 	fr := &fakeProcessRunner{}
@@ -974,6 +1005,49 @@ func TestProcessManager_Launch_ErrorExit_WritesErrorFile(t *testing.T) {
 	errBytes, err := os.ReadFile(filepath.Join(commDir, "mount-abc.error"))
 	assert.NoError(t, err)
 	assert.Equals(t, "credential error", string(errBytes))
+}
+
+func TestProcessManager_Launch_StartsWithNoEarlierErrorFile(t *testing.T) {
+	commDir := t.TempDir()
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(commDir, "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+	launch := func() error {
+		dev := mountertest.OpenDevNull(t)
+		return pm.Launch("mount-abc", "/usr/bin/mount-s3", mountoptions.Options{Uid: 65536, Gid: 65536, Fd: int(dev.Fd()), BucketName: "bucket"})
+	}
+	assert.NoError(t, launch())
+
+	// A FIFO holds the waiter's error-file write open until it is read, so whatever it guards stays visible.
+	errFile := filepath.Join(commDir, "mount-abc.error")
+	assert.NoError(t, syscall.Mkfifo(errFile, 0600))
+	fr.handles[0].Exit(1, "credential error")
+
+	relaunched := make(chan error, 1)
+	for {
+		go func() { relaunched <- launch() }()
+		select {
+		case err := <-relaunched:
+			if err == nil {
+				t.Fatal("relaunch accepted before the earlier exit's error file was written")
+			}
+			continue // still claimed; the waiter has not reached its write yet
+		case <-time.After(200 * time.Millisecond):
+		}
+		break
+	}
+
+	got, err := os.ReadFile(errFile)
+	assert.NoError(t, err)
+	assert.Equals(t, "credential error", string(got))
+	assert.NoError(t, <-relaunched)
+	_, err = os.Lstat(errFile)
+	assert.Equals(t, true, errors.Is(err, fs.ErrNotExist))
+
+	fr.mu.Lock()
+	h := fr.handles[len(fr.handles)-1]
+	fr.mu.Unlock()
+	h.Exit(0, "")
+	pm.Shutdown()
 }
 
 func TestProcessManager_Launch_RejectsCredentialsOutsideTheAllocatorRange(t *testing.T) {

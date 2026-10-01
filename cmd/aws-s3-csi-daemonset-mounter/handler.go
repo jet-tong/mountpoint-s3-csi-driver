@@ -40,5 +40,7 @@ func handleConnection(conn *net.UnixConn, mountpointPath string, pm *ProcessMana
 	err = pm.Launch(mountId, mountpointPath, options) // ownership of options.Fd is transferred here
 	if err != nil {
 		klog.Errorf("Failed to launch Mountpoint for mount %s: %v", mountId, err)
+		// Without it the driver waits its whole mount timeout and reports no reason.
+		pm.writeErrorFile(mountId, []byte(err.Error()))
 	}
 }

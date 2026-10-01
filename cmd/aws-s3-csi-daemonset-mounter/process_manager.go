@@ -142,6 +142,8 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		fuseDev.Close()
 		return fmt.Errorf("mount %s already has a running process", mountId)
 	}
+	// An earlier Mountpoint of this mount wrote it before freeing mountId, so it is not this launch's answer.
+	os.Remove(filepath.Join(pm.commDir, mountId+errorFileExt))
 
 	// After the duplicate check, so a relaunch cannot replace a directory a live Mountpoint is using.
 	if cached {
@@ -185,11 +187,14 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		}
 
 		pm.mu.Lock()
+		// Before freeing mountId, so a relaunch's removal of a stale error file always comes after this write.
+		if exitCode != 0 {
+			pm.writeErrorFile(mountId, stderr)
+		}
 		delete(pm.processes, mountId)
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
-			pm.writeErrorFile(mountId, stderr)
 			klog.Errorf("Mountpoint for mount %s exited with code %d", mountId, exitCode)
 		} else {
 			klog.Infof("Mountpoint for mount %s exited cleanly", mountId)

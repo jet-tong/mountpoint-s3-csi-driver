@@ -14,8 +14,8 @@
 //     the FUSE file descriptor via SCM_RIGHTS (Unix domain socket ancillary data).
 //  2. The mounter receives the options, spawns a Mountpoint child process with the FUSE fd,
 //     and closes the connection.
-//  3. If the Mountpoint process exits with a non-zero code, its stderr is written to
-//     <comm-dir>/<mount-id>.error. Nothing is written on clean (zero) exit.
+//  3. If the mounter refuses a request with a valid mount-id, or the Mountpoint process exits with a non-zero
+//     code, the reason or its stderr is written to <comm-dir>/<mount-id>.error. Nothing is written on clean (zero) exit.
 //     The driver is responsible for removing this file during Unmount.
 //
 // The mount-id (Options.VolumeId) must be unique per active mount (e.g. <WorkloadPodId>-<VolumeId>
