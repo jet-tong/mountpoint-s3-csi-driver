@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter/mountertest"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mountoptions"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
@@ -116,6 +117,8 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 			Args:       []string{"--region", "us-west-2"},
 			Env:        []string{"AWS_REGION=us-west-2"},
 			VolumeId:   "pod123-vol456",
+			Uid:        65536,
+			Gid:        65536,
 		})
 	}()
 
@@ -135,6 +138,12 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 	assert.Equals(t, []string{"AWS_REGION=us-west-2"}, cmd.Env)
 	assert.Equals(t, 1, len(fr.handles[0].extraFds)) // FD was passed
 
+	// The credentials must reach the child, or it would run as the mounter's root with no isolation.
+	cred := cmd.SysProcAttr.Credential
+	assert.Equals(t, uint32(65536), cred.Uid)
+	assert.Equals(t, uint32(65536), cred.Gid)
+	assert.Equals(t, 0, len(cred.Groups)) // supplementary groups cleared
+
 	// Cleanup
 	fr.handles[0].Exit(0, "")
 	pm.Shutdown()
@@ -147,6 +156,8 @@ func TestProcessManager_Launch_HappyPath(t *testing.T) {
 	dev := mountertest.OpenDevNull(t)
 
 	err := pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev.Fd()),
 		BucketName: "my-bucket",
 		Env:        []string{"AWS_REGION=us-east-1"},
@@ -225,6 +236,8 @@ func TestProcessManager_Launch_MemoryTarget(t *testing.T) {
 				Fd:         int(dev.Fd()),
 				BucketName: "my-bucket",
 				Args:       tc.args,
+				Uid:        mounter.UIDRangeStart,
+				Gid:        mounter.UIDRangeStart,
 			}
 			assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", options))
 
@@ -249,6 +262,8 @@ func TestProcessManager_Launch_TracksNothingWhenStartFails(t *testing.T) {
 	err := pm.Launch("mount-doomed", "/usr/bin/mount-s3", mountoptions.Options{
 		Fd:         int(dev.Fd()),
 		BucketName: "bucket",
+		Uid:        mounter.UIDRangeStart,
+		Gid:        mounter.UIDRangeStart,
 	})
 	if err == nil {
 		t.Fatal("expected Launch to fail when the process cannot start")
@@ -295,7 +310,13 @@ func TestProcessManager_Launch_MaxCacheSize(t *testing.T) {
 			pm, cacheDir := newProcessManagerWithCache(t, fr, testCase.cache)
 			dev := mountertest.OpenDevNull(t)
 
-			options := mountoptions.Options{Fd: int(dev.Fd()), BucketName: "my-bucket", Args: testCase.args}
+			options := mountoptions.Options{
+				Fd:         int(dev.Fd()),
+				BucketName: "my-bucket",
+				Args:       testCase.args,
+				Uid:        mounter.UIDRangeStart,
+				Gid:        mounter.UIDRangeStart,
+			}
 			assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", options))
 
 			// cmd.Args is [binary, bucket, /dev/fd/3, ...sorted args].
@@ -316,7 +337,12 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 
 	cachedOptions := func(t *testing.T, args ...string) mountoptions.Options {
 		dev := mountertest.OpenDevNull(t)
-		return mountoptions.Options{Fd: int(dev.Fd()), BucketName: "my-bucket", Args: append([]string{"--cache=/cache/" + mountId}, args...)}
+		return mountoptions.Options{
+			Fd:         int(dev.Fd()),
+			BucketName: "my-bucket",
+			Args:       append([]string{"--cache=/cache/" + mountId}, args...),
+			Uid:        mounter.UIDRangeStart,
+			Gid:        mounter.UIDRangeStart}
 	}
 
 	t.Run("creates the mount's directory, writable by the pod's fsGroup", func(t *testing.T) {
@@ -392,7 +418,8 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
 		dev := mountertest.OpenDevNull(t)
 
-		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", mountoptions.Options{Fd: int(dev.Fd()), BucketName: "my-bucket"}))
+		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", mountoptions.Options{
+			Fd: int(dev.Fd()), BucketName: "my-bucket", Uid: mounter.UIDRangeStart, Gid: mounter.UIDRangeStart}))
 
 		entries, err := os.ReadDir(cacheDir)
 		assert.NoError(t, err)
@@ -522,6 +549,8 @@ func TestProcessManager_Launch_MultipleProcesses(t *testing.T) {
 	for i, id := range []string{"mount-a", "mount-b", "mount-c"} {
 		dev := mountertest.OpenDevNull(t)
 		err := pm.Launch(id, "/usr/bin/mount-s3", mountoptions.Options{
+			Uid:        65536,
+			Gid:        65536,
 			Fd:         int(dev.Fd()),
 			BucketName: fmt.Sprintf("bucket-%d", i),
 		})
@@ -576,6 +605,8 @@ func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
 
 	dev1 := mountertest.OpenDevNull(t)
 	err := pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev1.Fd()),
 		BucketName: "bucket",
 	})
@@ -584,6 +615,8 @@ func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
 	// Second launch with same mountId should fail
 	dev2 := mountertest.OpenDevNull(t)
 	err = pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev2.Fd()),
 		BucketName: "bucket",
 	})
@@ -602,6 +635,8 @@ func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
 
 	dev3 := mountertest.OpenDevNull(t)
 	err = pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev3.Fd()),
 		BucketName: "bucket",
 	})
@@ -752,6 +787,8 @@ func TestProcessManager_Shutdown_SendsSIGTERM(t *testing.T) {
 
 	dev := mountertest.OpenDevNull(t)
 	err := pm.Launch("m1", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev.Fd()),
 		BucketName: "b",
 	})
@@ -799,6 +836,8 @@ func TestHandleConnection_NoFdLeak(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			mountoptions.Send(ctx, sockPath, mountoptions.Options{
+				Uid:        65536,
+				Gid:        65536,
 				Fd:         int(dev.Fd()),
 				BucketName: "bucket",
 				VolumeId:   volumeId,
@@ -867,6 +906,8 @@ func TestHandleConnection_MountIdValidation(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			mountoptions.Send(ctx, sockPath, mountoptions.Options{
+				Uid:        65536,
+				Gid:        65536,
 				Fd:         int(dev.Fd()),
 				BucketName: "bucket",
 				VolumeId:   id,
@@ -919,7 +960,14 @@ func TestHandleConnection_RefusedLaunchWritesErrorFile(t *testing.T) {
 		defer close(sendDone)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		mountoptions.Send(ctx, sockPath, mountoptions.Options{Fd: int(dev.Fd()), BucketName: "bucket", VolumeId: "s3-pv", Args: []string{"--cache=/cache/s3-pv"}})
+		mountoptions.Send(ctx, sockPath, mountoptions.Options{
+			Fd:         int(dev.Fd()),
+			BucketName: "bucket",
+			VolumeId:   "s3-pv",
+			Args:       []string{"--cache=/cache/s3-pv"},
+			Uid:        mounter.UIDRangeStart,
+			Gid:        mounter.UIDRangeStart,
+		})
 	}()
 
 	conn, err := listener.Accept()
@@ -940,6 +988,8 @@ func TestProcessManager_Launch_ErrorExit_WritesErrorFile(t *testing.T) {
 
 	dev := mountertest.OpenDevNull(t)
 	err := pm.Launch("mount-abc", "/usr/bin/mount-s3", mountoptions.Options{
+		Uid:        65536,
+		Gid:        65536,
 		Fd:         int(dev.Fd()),
 		BucketName: "bucket",
 	})
@@ -961,9 +1011,42 @@ func TestProcessManager_Launch_RemovesAnEarlierErrorFile(t *testing.T) {
 	assert.NoError(t, os.WriteFile(errFile, []byte("credential error"), 0600))
 
 	dev := mountertest.OpenDevNull(t)
-	assert.NoError(t, pm.Launch("mount-abc", "/usr/bin/mount-s3", mountoptions.Options{Fd: int(dev.Fd()), BucketName: "bucket"}))
+	assert.NoError(t, pm.Launch("mount-abc", "/usr/bin/mount-s3",
+		mountoptions.Options{Fd: int(dev.Fd()), BucketName: "bucket", Uid: 65536, Gid: 65536}))
 	assertNotExist(t, errFile)
 
 	fr.handles[0].Exit(0, "")
 	pm.Shutdown()
+}
+
+func TestProcessManager_Launch_RejectsCredentialsOutsideTheAllocatorRange(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		uid, gid uint32
+	}{
+		{"zero, the unset value", 0, 0},
+		{"below the range", mounter.UIDRangeStart - 1, mounter.UIDRangeStart - 1},
+		{"above the range", mounter.UIDRangeEnd + 1, mounter.UIDRangeEnd + 1},
+		{"GID not matching UID", mounter.UIDRangeStart, mounter.UIDRangeStart + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fr := &fakeProcessRunner{}
+			pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+			dev := mountertest.OpenDevNull(t)
+
+			err := pm.Launch("vol-bad-creds", "/usr/bin/mount-s3", mountoptions.Options{
+				Uid:        tc.uid,
+				Gid:        tc.gid,
+				Fd:         int(dev.Fd()),
+				BucketName: "bucket",
+			})
+			if err == nil {
+				t.Fatalf("expected Launch to refuse uid %d gid %d", tc.uid, tc.gid)
+			}
+
+			fr.mu.Lock()
+			defer fr.mu.Unlock()
+			assert.Equals(t, 0, len(fr.handles))
+		})
+	}
 }
