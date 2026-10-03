@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,4 +33,20 @@ func TestServe_EmptiesTheCacheVolumeBeforeListeningAndAfterStopping(t *testing.T
 	close(stop)
 	assert.NoError(t, <-done)
 	assertNotExist(t, filepath.Join(cacheDir, "pv-new"))
+}
+
+func TestServe_ExitsWithoutListeningWhenTheCacheVolumeCannotBeLocked(t *testing.T) {
+	pm, _ := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+	pm.chown = func(string, int, int) error { return syscall.EPERM }
+	sock := filepath.Join(t.TempDir(), mountSockName)
+	// Already closed, so a serve that wrongly gets past the lock returns instead of serving forever.
+	stop := make(chan struct{})
+	close(stop)
+
+	err := serve(pm, sock, "/usr/bin/mount-s3", stop)
+	if err == nil {
+		t.Fatal("expected serve to fail when the cache volume cannot be locked")
+	}
+	assert.Contains(t, err.Error(), "cannot chown")
+	assertNotExist(t, sock)
 }

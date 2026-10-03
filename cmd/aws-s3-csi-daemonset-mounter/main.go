@@ -63,6 +63,8 @@ const (
 )
 
 func main() {
+	runAsRemovalHelper(os.Args)
+
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -125,13 +127,17 @@ func main() {
 	}
 }
 
-// serve empties the cache volume, handles mount requests on sockPath until stop closes, then stops every Mountpoint
-// and empties the cache volume again.
+// serve locks and empties the cache volume, handles mount requests on sockPath until stop closes, then stops every
+// Mountpoint and empties the cache volume again.
 func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan struct{}) error {
+	if err := pm.secureCacheVolume(); err != nil {
+		return err
+	}
+
 	// Clean up cache directories after startup, to remove any leftover cache directories from previous mounter pod crash.
-	// A directory that cannot be removed fails only when its PV's next cached mount starts and removal is retried, to limit
+	// A directory that cannot be removed fails only the next launch as its UID, which retries the removal, to limit
 	// blast radius of a failed cleanup.
-	if err := pm.removeLeftoverCacheDirs(); err != nil {
+	if err := pm.emptyCacheVolume(); err != nil {
 		klog.Errorf("Some leftover cache directories remain: %v", err)
 	}
 
@@ -170,7 +176,7 @@ func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan stru
 	pm.Shutdown()
 
 	// Exit non-zero, so a cache volume the mounter cannot clean shows in the pod's status, not only in a log.
-	if err := pm.removeLeftoverCacheDirs(); err != nil {
+	if err := pm.emptyCacheVolume(); err != nil {
 		return fmt.Errorf("some cache directories could not be removed: %w", err)
 	}
 	return nil
