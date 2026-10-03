@@ -121,6 +121,69 @@ func (pm *ProcessManager) emptyCacheVolume() error {
 	return errors.Join(errs...)
 }
 
+// removeUntrackedCacheDirsPeriodically runs removeUntrackedCacheDirs at the given interval until stop closes.
+func (pm *ProcessManager) removeUntrackedCacheDirsPeriodically(interval time.Duration, stop <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			pm.removeUntrackedCacheDirs()
+		}
+	}
+}
+
+// removeUntrackedCacheDirs removes every mount cache directory that no running Mountpoint uses, e.g. after a failed removal.
+func (pm *ProcessManager) removeUntrackedCacheDirs() {
+	if pm.cacheDir == "" {
+		return
+	}
+	// Under the lock, as the pre-launch removal is, so no launch can race it; every launch waits for the removal helper, which has no deadline.
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	entries, err := os.ReadDir(pm.cacheDir)
+	if err != nil {
+		klog.Errorf("Failed to list cache volume %q for untracked cache directories: %v", pm.cacheDir, err)
+		return
+	}
+	for _, entry := range entries {
+		uid, ok := mountCacheDirUID(entry.Name())
+		if !ok {
+			continue
+		}
+		if _, running := pm.processes[uid]; running {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			klog.Errorf("Failed to find the owner of cache directory %s: %v", entry.Name(), err)
+			continue
+		}
+		// The removal helper would run as the owner, and a running Mountpoint's UID belongs to that Mountpoint alone.
+		if owner := info.Sys().(*syscall.Stat_t).Uid; owner != uid {
+			if _, running := pm.processes[owner]; running {
+				klog.Errorf("Leaving cache directory %s: it is owned by UID %d, which a running Mountpoint uses", entry.Name(), owner)
+				continue
+			}
+		}
+		klog.Warningf("Removing cache directory %s: no running Mountpoint uses UID %d", entry.Name(), uid)
+		if err := pm.removeCacheVolumeEntry(entry.Name()); err != nil {
+			klog.Errorf("Failed to remove untracked cache directory %s: %v", entry.Name(), err)
+		}
+	}
+}
+
+// mountCacheDirUID is the inverse of mountCacheDirName, for UIDs in the allocator's range.
+func mountCacheDirUID(name string) (uid uint32, ok bool) {
+	n, err := strconv.ParseUint(strings.TrimPrefix(name, "uid-"), 10, 32)
+	if err != nil || n < mounter.UIDRangeStart || n > mounter.UIDRangeEnd || mountCacheDirName(uint32(n)) != name {
+		return 0, false
+	}
+	return uint32(n), true
+}
+
 // Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
 // Takes ownership of options.Fd, caller must not close it after calling this function.
 // Returns an error if a process with the same mountId or UID is already running.

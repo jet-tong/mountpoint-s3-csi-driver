@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
@@ -1047,4 +1049,79 @@ func TestCleanupOrphans_MountTableReadError(t *testing.T) {
 	dm.CleanupOrphans()
 
 	assert.Equals(t, true, dm.mountMap.Get("vol-1") != nil)
+}
+
+func TestCleanupOrphans_CommDir(t *testing.T) {
+	setup := func(t *testing.T) (*DaemonsetMounter, string) {
+		kubeletPath := t.TempDir()
+		dm, _ := newTestDMWithFakeMounter(kubeletPath, fakeMountInfoProvider(nil))
+		// Short, as a unix socket path is at most 108 bytes.
+		commDir := t.TempDir()
+		dm.mounter.Store(&mounterPod{commDir: commDir})
+		return dm, commDir
+	}
+	plantCredentials := func(t *testing.T, dir string) {
+		assert.NoError(t, os.MkdirAll(dir, 0700))
+		assert.NoError(t, os.WriteFile(filepath.Join(dir, "token.jwt"), []byte("secret"), 0400))
+	}
+
+	t.Run("removes the credential directories and error files of PVs with no mount", func(t *testing.T) {
+		dm, commDir := setup(t)
+		plantCredentials(t, filepath.Join(commDir, "pv-gone"))
+		// A Mountpoint that failed after its unmount had finished.
+		assert.NoError(t, os.WriteFile(filepath.Join(commDir, "pv-crashed.error"), []byte("boom"), 0600))
+		// PV names may contain dots, so this is a PV's credential directory, not an error file.
+		plantCredentials(t, filepath.Join(commDir, "x.error"))
+
+		dm.CleanupOrphans()
+
+		for _, name := range []string{"pv-gone", "pv-crashed.error", "x.error"} {
+			assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, name))))
+		}
+		// The pass locks each PV through a map entry of its own, which must not outlive the pass.
+		entries := 0
+		dm.mountMap.Range(func(string, *MountEntry) bool { entries++; return true })
+		assert.Equals(t, 0, entries)
+	})
+
+	t.Run("leaves a mounted PV's entries, the mount socket and dot-names", func(t *testing.T) {
+		dm, commDir := setup(t)
+		seedEntry(dm, "pv-live", SourceMountPath(dm.kubeletPath, "pv-live"), commDir, nil)
+		plantCredentials(t, filepath.Join(commDir, "pv-live"))
+		assert.NoError(t, os.WriteFile(filepath.Join(commDir, "pv-live.error"), []byte("boom"), 0600))
+		listener, err := net.Listen("unix", filepath.Join(commDir, "mount.sock"))
+		assert.NoError(t, err)
+		t.Cleanup(func() { listener.Close() })
+		// A PV name cannot start with a dot.
+		plantCredentials(t, filepath.Join(commDir, ".tmp"))
+
+		dm.cleanupOrphanedCommEntries()
+
+		for _, name := range []string{"pv-live", "pv-live.error", "mount.sock", ".tmp"} {
+			assert.NoError(t, statErr(filepath.Join(commDir, name)))
+		}
+	})
+
+	t.Run("leaves the credentials of a publish in flight", func(t *testing.T) {
+		dm, commDir := setup(t)
+		credentials := filepath.Join(commDir, "pv-new")
+		plantCredentials(t, credentials)
+		publishing, _ := dm.mountMap.GetOrCreate("pv-new")
+		publishing.mu.Lock()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			dm.cleanupOrphanedCommEntries()
+		}()
+		// 100ms gives a pass that ignores the lock ample time to remove the credentials.
+		time.Sleep(100 * time.Millisecond)
+		// That publish failed and forgot its entry; its retry mounted under a new one.
+		dm.mountMap.Delete("pv-new")
+		seedEntry(dm, "pv-new", SourceMountPath(dm.kubeletPath, "pv-new"), commDir, nil)
+		publishing.mu.Unlock()
+		<-done
+
+		assert.NoError(t, statErr(credentials))
+	})
 }

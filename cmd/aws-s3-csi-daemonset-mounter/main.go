@@ -22,8 +22,7 @@
 // or just <VolumeId> with pod sharing). Duplicate mount-ids are rejected.
 //
 // Note: if Mountpoint crashes with non-zero exit after the driver has already completed Unmount,
-// a small .error file may be left behind. This is bounded by the number of such rare race
-// occurrences and each file is only a few KB of stderr.
+// a small .error file is left behind until the driver's periodic cleanup removes it.
 package main
 
 import (
@@ -61,6 +60,9 @@ const (
 	mountSockName = "mount.sock"
 	mountpointBin = "mount-s3"
 )
+
+// untrackedCacheDirsInterval matches s3-csi-node's periodic cleanup; a var so tests need not wait two minutes.
+var untrackedCacheDirsInterval = 2 * time.Minute
 
 func main() {
 	runAsRemovalHelper(os.Args)
@@ -157,6 +159,12 @@ func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan stru
 		listener.Close()
 	}()
 
+	untrackedCacheDirsDone := make(chan struct{})
+	go func() {
+		defer close(untrackedCacheDirsDone)
+		pm.removeUntrackedCacheDirsPeriodically(untrackedCacheDirsInterval, stop)
+	}()
+
 	// Accept loop — sequential, kernel backlog queues concurrent requests
 	for {
 		conn, err := listener.Accept()
@@ -173,6 +181,8 @@ func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan stru
 		handleConnection(conn.(*net.UnixConn), mountpointPath, pm, *recvTimeout)
 	}
 
+	// So no periodic removal runs beside exit cleanup on the same entries.
+	<-untrackedCacheDirsDone
 	pm.Shutdown()
 
 	// Exit non-zero, so a cache volume the mounter cannot clean shows in the pod's status, not only in a log.

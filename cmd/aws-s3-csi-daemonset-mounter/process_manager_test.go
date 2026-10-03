@@ -294,6 +294,90 @@ func TestProcessManager_EmptyCacheVolume(t *testing.T) {
 	})
 }
 
+func TestProcessManager_RemoveUntrackedCacheDirs(t *testing.T) {
+	// A killed Mountpoint's leftover, which only the removal helper can empty.
+	plantCachedBlock := func(t *testing.T, dir string) {
+		blockDir := filepath.Join(dir, "mountpoint-cache", "V2", "ab", "cdef")
+		assert.NoError(t, os.MkdirAll(blockDir, 0700))
+		assert.NoError(t, os.WriteFile(filepath.Join(blockDir, "0000000000"), []byte("x"), 0600))
+	}
+
+	t.Run("removes the directory of a UID no running Mountpoint uses, and keeps a running one's", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		plantCachedBlock(t, filepath.Join(cacheDir, "uid-65537"))
+		plantCachedBlock(t, filepath.Join(cacheDir, "uid-65538"))
+		pm.processes[65538] = mountpointProcess{mountId: "pv-running"}
+
+		pm.removeUntrackedCacheDirs()
+
+		assertNotExist(t, filepath.Join(cacheDir, "uid-65537"))
+		_, err := os.Lstat(filepath.Join(cacheDir, "uid-65538", "mountpoint-cache", "V2", "ab", "cdef", "0000000000"))
+		assert.NoError(t, err)
+	})
+
+	t.Run("leaves every entry that is not a mount's cache directory", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		dirs := []string{"lost+found", "uid-065537", "uid-65537x", "uid-1", "uid-131072", "deleting-uid-65537-1"}
+		for _, name := range dirs {
+			plantCachedBlock(t, filepath.Join(cacheDir, name))
+		}
+		provisionerFile := filepath.Join(cacheDir, "provisioner-file")
+		assert.NoError(t, os.WriteFile(provisionerFile, []byte("x"), 0600))
+
+		pm.removeUntrackedCacheDirs()
+
+		for _, name := range dirs {
+			_, err := os.Lstat(filepath.Join(cacheDir, name, "mountpoint-cache"))
+			assert.NoError(t, err)
+		}
+		_, err := os.Lstat(provisionerFile)
+		assert.NoError(t, err)
+	})
+
+	t.Run("leaves a directory whose owner is a running Mountpoint's UID", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		plantCachedBlock(t, filepath.Join(cacheDir, "uid-65537"))
+		// The test user owns the directory; an unprivileged test cannot give it to a UID in the range.
+		pm.processes[uint32(os.Getuid())] = mountpointProcess{mountId: "pv-running"}
+
+		pm.removeUntrackedCacheDirs()
+
+		_, err := os.Lstat(filepath.Join(cacheDir, "uid-65537", "mountpoint-cache"))
+		assert.NoError(t, err)
+	})
+
+	t.Run("removes nothing while a launch holds the lock", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		leftover := filepath.Join(cacheDir, "uid-65537")
+		plantCachedBlock(t, leftover)
+
+		pm.mu.Lock()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			pm.removeUntrackedCacheDirs()
+		}()
+		// 100ms gives a pass that ignores the lock ample time to remove the directory.
+		time.Sleep(100 * time.Millisecond)
+		_, err := os.Lstat(leftover)
+		assert.NoError(t, err)
+		pm.mu.Unlock()
+
+		<-done
+		assertNotExist(t, leftover)
+	})
+
+	t.Run("does nothing without a cache volume", func(t *testing.T) {
+		pm := NewProcessManager(t.TempDir(), "", &fakeProcessRunner{}, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+		logs := captureKlog(t)
+
+		pm.removeUntrackedCacheDirs()
+
+		// Note: without the "" check this would log a failed listing every two minutes.
+		assert.Equals(t, "", logs.String())
+	})
+}
+
 func TestProcessManager_Launch_HappyPath(t *testing.T) {
 	commDir := t.TempDir()
 	fr := &fakeProcessRunner{}

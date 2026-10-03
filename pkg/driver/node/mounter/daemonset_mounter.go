@@ -636,11 +636,14 @@ func (dm *DaemonsetMounter) StartPeriodicCleanup(stopCh <-chan struct{}) {
 //   - if the source mount is unhealthy, tear it down;
 //   - otherwise reconcile the refcount against the live bind mounts, and if it drops
 //     to zero, tear it down.
+//
+// Then it removes what no mount owns from the mounter's comm directory.
 func (dm *DaemonsetMounter) CleanupOrphans() {
 	dm.mountMap.Range(func(volumeID string, entry *MountEntry) bool {
 		dm.cleanupEntry(volumeID, entry)
 		return true
 	})
+	dm.cleanupOrphanedCommEntries()
 }
 
 // cleanupEntry reconciles and, if needed, tears down a single mount entry.
@@ -733,6 +736,53 @@ func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
 		return
 	}
 	dm.uidAllocator.Release(entry.Uid)
+	dm.mountMap.Delete(volumeID)
+}
+
+// cleanupOrphanedCommEntries removes the credential directories and error files in the mounter's comm directory that
+// no mount owns, e.g. the error file of a Mountpoint that failed after its unmount.
+func (dm *DaemonsetMounter) cleanupOrphanedCommEntries() {
+	commDir, err := dm.GetCommDir()
+	if err != nil {
+		return
+	}
+	dirEntries, err := os.ReadDir(commDir)
+	if err != nil {
+		klog.Errorf("DaemonsetMounter: cleanup: failed to list comm directory %s: %v", commDir, err)
+		return
+	}
+	for _, dirEntry := range dirEntries {
+		// Directories first, as a PV named x.error has a credential directory x.error.
+		var volumeID string
+		switch name := dirEntry.Name(); {
+		case strings.HasPrefix(name, "."):
+			// A PV name cannot start with a dot, so this is no PV's.
+			continue
+		case dirEntry.IsDir():
+			volumeID = name
+		case strings.HasSuffix(name, MountErrorSuffix):
+			volumeID = strings.TrimSuffix(name, MountErrorSuffix)
+		default:
+			continue
+		}
+		dm.cleanupOrphanedCommEntry(commDir, volumeID)
+	}
+}
+
+// cleanupOrphanedCommEntry removes a PV's credential directory and error file in commDir if the PV has no mount.
+func (dm *DaemonsetMounter) cleanupOrphanedCommEntry(commDir, volumeID string) {
+	entry, _ := dm.mountMap.GetOrCreate(volumeID)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	// Blank means no publish has mounted this PV: one sets SourcePath under this lock before it writes credentials.
+	if dm.mountMap.Get(volumeID) != entry || entry.SourcePath != "" {
+		return
+	}
+	klog.V(2).Infof("DaemonsetMounter: cleanup: removing comm directory entries of volume %s, which has no mount", volumeID)
+	orphan := &MountEntry{VolumeID: volumeID, CommDir: commDir}
+	if err := dm.cleanupMount(orphan, credentialprovider.CleanupContext{VolumeID: volumeID}); err != nil {
+		klog.Errorf("DaemonsetMounter: cleanup: %v (will retry next tick)", err)
+	}
 	dm.mountMap.Delete(volumeID)
 }
 
