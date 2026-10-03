@@ -64,6 +64,7 @@ const (
 
 func main() {
 	runAsRemovalHelper(os.Args)
+	runAsKillHelper(os.Args)
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -139,6 +140,10 @@ func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan stru
 	// blast radius of a failed cleanup.
 	if err := pm.emptyCacheVolume(); err != nil {
 		klog.Errorf("Some leftover cache directories remain: %v", err)
+	}
+	// Nothing runs yet, so every UID marker is stale; one left only keeps csi-node off its UID.
+	if err := pm.removeUIDMarkers(); err != nil {
+		klog.Errorf("Some UID markers remain: %v", err)
 	}
 
 	// Remove stale socket file if it exists

@@ -5,15 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/mounter/mountertest"
@@ -57,14 +61,19 @@ type fakeProcessRunner struct {
 	nextPid    int
 	handles    []*fakeProcessHandle
 	startErr   error       // when set, Start fails instead of spawning
-	helperCmds []*exec.Cmd // the removal helpers started, which run in-process as the test user
-	helperErr  error       // when set, every removal helper fails instead of emptying
+	helperCmds []*exec.Cmd // the removal and kill helpers started, which run in-process as the test user
+	helperErr  error       // when set, every helper fails instead of running
+
+	// A fake PID namespace for ProcessUIDs: the UIDs with a process left, and those a kill helper cannot stop.
+	leftovers map[uint32]bool
+	survivors map[uint32]bool
+	scanErr   error
 }
 
 func (r *fakeProcessRunner) Start(cmd *exec.Cmd) (ProcessHandle, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cmd.Args[1] == emptyDirArg {
+	if cmd.Args[1] == emptyDirArg || cmd.Args[1] == killProcessesArg {
 		return r.runHelper(cmd), nil
 	}
 	if r.startErr != nil {
@@ -91,12 +100,23 @@ func (r *fakeProcessRunner) runHelper(cmd *exec.Cmd) ProcessHandle {
 	h := &fakeProcessHandle{done: make(chan struct{})}
 	if r.helperErr != nil {
 		h.Exit(1, r.helperErr.Error())
+	} else if cmd.Args[1] == killProcessesArg {
+		if uid := cmd.SysProcAttr.Credential.Uid; !r.survivors[uid] {
+			delete(r.leftovers, uid)
+		}
+		h.Exit(0, "")
 	} else if err := emptyDirAsOwner(cmd.Args[2]); err != nil {
 		h.Exit(1, err.Error())
 	} else {
 		h.Exit(0, "")
 	}
 	return h
+}
+
+func (r *fakeProcessRunner) ProcessUIDs() (map[uint32]bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.leftovers), r.scanErr
 }
 
 // newProcessManagerWithCache returns a manager whose container has a cache volume, and that volume.
@@ -136,6 +156,16 @@ func assertNotExist(t *testing.T, path string) {
 	t.Helper()
 	_, err := os.Lstat(path)
 	assert.Equals(t, true, errors.Is(err, fs.ErrNotExist))
+}
+
+// waitAndAssert polls until done reports true, and fails the test if it does not within timeout.
+func waitAndAssert(t *testing.T, what string, timeout time.Duration, done func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(timeout); !done(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting until %s", timeout, what)
+		}
+	}
 }
 
 // --- Tests ---
@@ -314,6 +344,8 @@ func TestProcessManager_Launch_HappyPath(t *testing.T) {
 	assert.Equals(t, []string{"/usr/bin/mount-s3", "my-bucket", "/dev/fd/3", "--foreground"}, cmd.Args)
 	assert.Equals(t, []uintptr{dev.Fd()}, fr.handles[0].extraFds)
 	assert.Equals(t, []string{"AWS_REGION=us-east-1"}, cmd.Env)
+	// Without it, a process Mountpoint left behind holding its output pipes blocks the waiter for good.
+	assert.Equals(t, true, cmd.WaitDelay > 0)
 
 	// Verify tracked
 	pm.mu.Lock()
@@ -927,6 +959,153 @@ func TestProcessManager_Launch_DuplicateUID_Rejected(t *testing.T) {
 	pm.Shutdown()
 }
 
+func TestProcessManager_Launch_RefusesAUIDThatStillHasProcesses(t *testing.T) {
+	testCases := []struct {
+		name   string
+		runner *fakeProcessRunner
+	}{
+		{name: "refuses a UID that a process was left behind as", runner: &fakeProcessRunner{leftovers: map[uint32]bool{65536: true}}},
+		{name: "refuses when the processes cannot be listed", runner: &fakeProcessRunner{scanErr: errors.New("permission denied")}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pm := NewProcessManager(t.TempDir(), "", testCase.runner, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+			dev := mountertest.OpenDevNull(t)
+
+			err := pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+				Fd: int(dev.Fd()), BucketName: "bucket", Uid: 65536, Gid: 65536})
+			if err == nil {
+				t.Fatal("expected Launch to refuse the UID")
+			}
+			// The error reaches this mount's pod events, so the reason goes to the log only.
+			assert.Equals(t, "refusing to launch mount mount-123: UID 65536 is already in use", err.Error())
+			assert.Equals(t, 0, len(testCase.runner.handles))
+			// Refuse only: a kill helper here would run under the lock every mount request needs.
+			assert.Equals(t, 0, len(testCase.runner.helperCmds))
+		})
+	}
+}
+
+func TestProcessManager_Launch_UIDMarker(t *testing.T) {
+	launch := func(t *testing.T, pm *ProcessManager) error {
+		dev := mountertest.OpenDevNull(t)
+		return pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+			Fd: int(dev.Fd()), BucketName: "bucket", Uid: 65536, Gid: 65536})
+	}
+
+	t.Run("keeps a root-only marker of the UID in the comm directory while its Mountpoint is tracked", func(t *testing.T) {
+		commDir := t.TempDir()
+		fr := &fakeProcessRunner{}
+		pm := NewProcessManager(commDir, "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+		// The name csi-node's allocator looks for.
+		marker := filepath.Join(commDir, ".uid-65536")
+
+		assert.NoError(t, launch(t, pm))
+		fi, err := os.Lstat(marker)
+		assert.NoError(t, err)
+		assert.Equals(t, true, fi.Mode().IsRegular())
+		assert.Equals(t, fs.FileMode(0600), fi.Mode().Perm())
+
+		fr.handles[0].Exit(0, "")
+		pm.Shutdown()
+		assertNotExist(t, marker)
+	})
+
+	t.Run("removes the marker when Mountpoint fails to start", func(t *testing.T) {
+		commDir := t.TempDir()
+		pm := NewProcessManager(commDir, "", &fakeProcessRunner{startErr: errors.New("fork/exec: no such file")},
+			memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		if err := launch(t, pm); err == nil {
+			t.Fatal("expected Launch to fail when the process cannot start")
+		}
+		assertNotExist(t, filepath.Join(commDir, ".uid-65536"))
+	})
+
+	t.Run("refuses the launch when the marker cannot be written", func(t *testing.T) {
+		// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case.
+		assert.Equals(t, false, os.Geteuid() == 0)
+		commDir := t.TempDir()
+		assert.NoError(t, os.Chmod(commDir, 0500))
+		t.Cleanup(func() { os.Chmod(commDir, 0700) })
+		fr := &fakeProcessRunner{}
+		pm := NewProcessManager(commDir, "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		if err := launch(t, pm); err == nil {
+			t.Fatal("expected Launch to refuse a UID it cannot mark")
+		}
+		assert.Equals(t, 0, len(fr.handles))
+	})
+}
+
+func TestProcessManager_Launch_StopsLeftoverProcesses(t *testing.T) {
+	const uid = 65536
+
+	t.Run("stops the processes a Mountpoint left behind before removing its directory", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		dev := mountertest.OpenDevNull(t)
+		assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+			Fd: int(dev.Fd()), BucketName: "bucket", Args: []string{"--cache=/cache/mount-123"}, Uid: uid, Gid: uid}))
+		// A killed Mountpoint that had forked leaves its blocks and a process of its UID.
+		dir := filepath.Join(cacheDir, "uid-65536")
+		assert.NoError(t, os.MkdirAll(filepath.Join(dir, "mountpoint-cache"), 0700))
+		assert.NoError(t, os.WriteFile(filepath.Join(dir, "mountpoint-cache", "block"), []byte("x"), 0600))
+		fr.mu.Lock()
+		fr.leftovers = map[uint32]bool{uid: true}
+		fr.mu.Unlock()
+
+		fr.handles[0].Exit(137, "")
+		pm.Shutdown()
+
+		fr.mu.Lock()
+		defer fr.mu.Unlock()
+		assert.Equals(t, 0, len(fr.leftovers))
+		var helpers [][]string
+		for _, cmd := range fr.helperCmds {
+			helpers = append(helpers, cmd.Args[1:])
+		}
+		// Killed first: a leftover process of the UID could stop the removal helper, or write into the directory.
+		assert.Equals(t, [][]string{{killProcessesArg}, {emptyDirArg, dir}}, helpers)
+		assertNotExist(t, dir)
+	})
+
+	t.Run("keeps an uncached mount's UID marked while its processes survive, and stops retrying once Shutdown starts", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		commDir := t.TempDir()
+		pm := NewProcessManager(commDir, "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+		dev := mountertest.OpenDevNull(t)
+		assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+			Fd: int(dev.Fd()), BucketName: "bucket", Uid: uid, Gid: uid}))
+		fr.mu.Lock()
+		fr.leftovers = map[uint32]bool{uid: true}
+		fr.survivors = map[uint32]bool{uid: true}
+		fr.mu.Unlock()
+		fr.handles[0].Exit(0, "")
+		// A kill past the first stop's rounds, so the UID is shown kept by a retry rather than by a stop still running.
+		waitAndAssert(t, "a stop was retried", 5*time.Second, func() bool {
+			fr.mu.Lock()
+			defer fr.mu.Unlock()
+			return len(fr.helperCmds) > stopRounds
+		})
+
+		done := make(chan struct{})
+		go func() {
+			pm.Shutdown()
+			close(done)
+		}()
+		select {
+		case <-done:
+		// Well short of maxStopRetryInterval, so only a retry that ignores Shutdown takes this long.
+		case <-time.After(5 * time.Second):
+			t.Fatal("Shutdown did not return while a stop kept failing")
+		}
+		// Its processes may still run, so csi-node must not hand the UID out while this mounter exits.
+		_, err := os.Stat(filepath.Join(commDir, ".uid-65536"))
+		assert.NoError(t, err)
+	})
+}
+
 func TestProcessManager_RemoveCacheVolumeEntry(t *testing.T) {
 	t.Run("removes an empty directory itself, without the helper", func(t *testing.T) {
 		fr := &fakeProcessRunner{}
@@ -1076,6 +1255,96 @@ func TestProcessManager_ChownWithDefault(t *testing.T) {
 		if err := pm.chownWithDefault(link, os.Getuid(), os.Getgid()); err == nil {
 			t.Fatal("expected chownWithDefault to refuse a symlink")
 		}
+	})
+}
+
+func TestProcessManager_StopProcessesOf(t *testing.T) {
+	const uid = 65537
+
+	t.Run("kills as the UID until none of its processes is left", func(t *testing.T) {
+		fr := &fakeProcessRunner{leftovers: map[uint32]bool{uid: true, 65538: true}}
+		pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		assert.NoError(t, pm.stopProcessesOf(uid))
+
+		assert.Equals(t, map[uint32]bool{65538: true}, fr.leftovers)
+		assert.Equals(t, 1, len(fr.helperCmds))
+		helper := fr.helperCmds[0]
+		assert.Equals(t, []string{killProcessesArg}, helper.Args[1:])
+		// Note: only exec.CommandContext sets Cancel, which kills a helper still running at the context's deadline.
+		assert.Equals(t, true, helper.Cancel != nil)
+		// Without it the deadline does not bound Wait while a process of the UID holds the helper's stderr.
+		assert.Equals(t, true, helper.WaitDelay > 0)
+		// Note: the helper's credentials and environment are tested via TestProcessManager_RemoveCacheVolumeEntry, as both helpers start through runHelper.
+	})
+
+	t.Run("starts no helper when the UID has no process", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		assert.NoError(t, pm.stopProcessesOf(uid))
+		// Note: other tests fail too if every exit starts a helper, but only by their timing; this one names the cause.
+		assert.Equals(t, 0, len(fr.helperCmds))
+	})
+
+	t.Run("fails when the processes survive every kill", func(t *testing.T) {
+		fr := &fakeProcessRunner{leftovers: map[uint32]bool{uid: true}, survivors: map[uint32]bool{uid: true}}
+		pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		err := pm.stopProcessesOf(uid)
+		if err == nil {
+			t.Fatal("expected stopProcessesOf to fail while a process of the UID survives")
+		}
+		assert.Contains(t, err.Error(), "still running after 3 kills")
+		assert.Equals(t, stopRounds, len(fr.helperCmds))
+	})
+
+	t.Run("fails when the processes cannot be listed", func(t *testing.T) {
+		fr := &fakeProcessRunner{scanErr: errors.New("permission denied")}
+		pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		err := pm.stopProcessesOf(uid)
+		if err == nil {
+			t.Fatal("expected stopProcessesOf to fail when it cannot list processes")
+		}
+		assert.Contains(t, err.Error(), "permission denied")
+		assert.Equals(t, 0, len(fr.helperCmds))
+	})
+
+	t.Run("refuses a UID that is not a Mountpoint's, without starting a helper", func(t *testing.T) {
+		// As root, kill(-1) would reach every Mountpoint.
+		for _, notMountpoint := range []uint32{0, mounter.UIDRangeStart - 1, mounter.UIDRangeEnd + 1} {
+			fr := &fakeProcessRunner{leftovers: map[uint32]bool{notMountpoint: true}}
+			pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+			if err := pm.stopProcessesOf(notMountpoint); err == nil {
+				t.Fatalf("expected stopProcessesOf to refuse UID %d", notMountpoint)
+			}
+			assert.Equals(t, 0, len(fr.helperCmds))
+		}
+	})
+}
+
+func TestReapOrphansOf(t *testing.T) {
+	t.Run("reaps a zombie of the UID that was reparented to this process", func(t *testing.T) {
+		// Makes the test process adopt orphans, as the mounter does by being PID 1 of its namespace.
+		assert.NoError(t, unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0))
+		t.Cleanup(func() { unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) })
+		// sh exits at once, so its background child is reparented to this process.
+		out, err := exec.Command("sh", "-c", "sleep 0.1 >/dev/null 2>&1 & echo $!").Output()
+		assert.NoError(t, err)
+		orphan, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		assert.NoError(t, err)
+		// Bounds the failing case only; sleep exits after 0.1s.
+		waitAndAssert(t, "the orphan became a zombie", 5*time.Second, func() bool { return procState(t, orphan) == "Z" })
+
+		// Another UID's reap leaves it: a release reaps only its own UID.
+		reapOrphansOf(uint32(os.Getuid()) + 1)
+		_, err = os.Stat(filepath.Join("/proc", strconv.Itoa(orphan)))
+		assert.NoError(t, err)
+
+		reapOrphansOf(uint32(os.Getuid()))
+		assertNotExist(t, filepath.Join("/proc", strconv.Itoa(orphan)))
 	})
 }
 

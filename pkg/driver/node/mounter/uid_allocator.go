@@ -3,7 +3,10 @@ package mounter
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -42,8 +45,9 @@ func NewUIDAllocator() *UIDAllocator {
 	}
 }
 
-// Allocate claims and returns a free UID, or [ErrUIDRangeExhausted] if there is none.
-func (a *UIDAllocator) Allocate() (uint32, error) {
+// Allocate claims and returns a free UID that the mounter pod with comm directory commDir does not mark as still in use, or
+// [ErrUIDRangeExhausted] if there is none.
+func (a *UIDAllocator) Allocate(commDir string) (uint32, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -57,13 +61,24 @@ func (a *UIDAllocator) Allocate() (uint32, error) {
 			a.cursor = UIDRangeStart
 		}
 
-		if _, taken := a.allocated[candidate]; !taken {
-			a.allocated[candidate] = struct{}{}
-			return candidate, nil
+		if _, taken := a.allocated[candidate]; taken {
+			continue
 		}
+		// This mount's credentials are written as the UID before the mounter can refuse it, so any stat error but
+		// not-exist counts as in use.
+		if _, err := os.Stat(filepath.Join(commDir, uidMarkerName(candidate))); !errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		a.allocated[candidate] = struct{}{}
+		return candidate, nil
 	}
 
 	return math.MaxUint32, ErrUIDRangeExhausted
+}
+
+// uidMarkerName names the file the mounter pod keeps in its comm directory while processes of uid may remain.
+func uidMarkerName(uid uint32) string {
+	return fmt.Sprintf(".uid-%d", uid)
 }
 
 // Release makes a UID available to [UIDAllocator.Allocate] again. Releasing a UID that is not

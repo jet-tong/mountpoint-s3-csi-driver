@@ -421,6 +421,27 @@ func TestDaemonsetMounter(t *testing.T) {
 			assert.Equals(t, uint32(mounter.UIDRangeStart), got.Uid)
 		})
 
+		t.Run("Skips a UID the mounter pod still marks as in use", func(t *testing.T) {
+			testCtx := setupDM(t)
+			target := testCtx.targetPath(testCtx.podUID)
+			// The mounter keeps this while processes of the UID may remain, e.g. after this driver restarted.
+			assert.NoError(t, os.WriteFile(filepath.Join(testCtx.commDir, ".uid-65536"), nil, 0600))
+
+			mountRes := make(chan error, 1)
+			go func() {
+				mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, credentialprovider.ProvideContext{
+					WorkloadPodID: testCtx.podUID,
+					VolumeID:      testCtx.volumeID,
+				}, nil, mountpoint.ParseArgs(nil), "", nil)
+			}()
+
+			got := testCtx.receiveMountOptions()
+			testCtx.mount.Mount("mountpoint-s3", mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID), "fuse", nil)
+			assert.NoError(t, <-mountRes)
+
+			assert.Equals(t, uint32(mounter.UIDRangeStart+1), got.Uid)
+		})
+
 		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
 			mockCtl := gomock.NewController(t)
 			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)

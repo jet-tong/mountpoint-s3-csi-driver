@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +38,25 @@ const mountCacheDirPerm = fs.FileMode(0700)
 // emptyDirArg makes this binary empty a cache directory as its owner, since the mounter cannot read inside one.
 const emptyDirArg = "empty-cache-dir"
 
+// killProcessesArg makes this binary kill every process of the UID it runs as, so the mounter never signals a PID read from /proc.
+const killProcessesArg = "kill-processes"
+
+const (
+	// killHelperTimeout bounds a kill helper, which a leftover process of the same UID is allowed to stop.
+	killHelperTimeout = 5 * time.Second
+	// SIGKILL takes effect when each process next runs, and a fork loop can outrun one kill.
+	stopRounds           = 3
+	stopRoundPause       = 100 * time.Millisecond
+	stopRetryInterval    = time.Second
+	maxStopRetryInterval = time.Minute
+	// childWaitDelay lets Wait return when a process left behind still holds a child's stdout or stderr.
+	childWaitDelay = 5 * time.Second
+)
+
+// uidMarkerPrefix and uidMarkerPerm describe the root-only file in the comm directory that tells csi-node a UID is still in use here.
+const uidMarkerPrefix = ".uid-"
+const uidMarkerPerm = fs.FileMode(0600)
+
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
 	commDir  string
@@ -48,6 +69,8 @@ type ProcessManager struct {
 	mu        sync.Mutex
 	processes map[uint32]mountpointProcess // the UID a Mountpoint runs as -> that Mountpoint; one per UID
 	wg        sync.WaitGroup               // tracks waiter goroutines
+
+	shutdown chan struct{} // closed by Shutdown, so a waiter stops retrying
 }
 
 // mountpointProcess is a running Mountpoint and the mount it serves.
@@ -64,6 +87,7 @@ func NewProcessManager(commDir, cacheDir string, runner ProcessRunner, memory me
 		memory:    memory,
 		cache:     cache,
 		processes: make(map[uint32]mountpointProcess),
+		shutdown:  make(chan struct{}),
 	}
 }
 
@@ -121,6 +145,23 @@ func (pm *ProcessManager) emptyCacheVolume() error {
 	return errors.Join(errs...)
 }
 
+// removeUIDMarkers removes every UID marker in the comm directory, which a previous mounter in this pod may have left.
+func (pm *ProcessManager) removeUIDMarkers() error {
+	entries, err := os.ReadDir(pm.commDir)
+	if err != nil {
+		return fmt.Errorf("failed to list comm directory %q: %w", pm.commDir, err)
+	}
+	var errs []error
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), uidMarkerPrefix) {
+			if err := os.Remove(filepath.Join(pm.commDir, entry.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
 // Takes ownership of options.Fd, caller must not close it after calling this function.
 // Returns an error if a process with the same mountId or UID is already running.
@@ -174,6 +215,8 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	cmd.Env = options.Env
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
 	cmd.Stderr = newPrefixWriter(os.Stderr, mountId)
+	// Without it, a process Mountpoint left behind holding these pipes would keep Wait, and so the stop below, from running.
+	cmd.WaitDelay = childWaitDelay
 
 	// Give the child the per-mount credentials csi-node determined, so the kernel isolates it from
 	// every other Mountpoint on this node. Supplementary groups are cleared: the mounter runs as
@@ -207,6 +250,18 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		// We rely on csi-node's UID allocator moving its cursor on, so the NodePublishVolume retry gets another UID.
 		return fmt.Errorf("refusing to launch mount %s: UID %d is already in use by another mount", mountId, options.Uid)
 	}
+	// A process left behind as this UID could read this mount's credentials and cache. The waiter stops a UID's processes
+	// before freeing it, so this refuses only after a bug, or for a process an admin started as this UID.
+	if uids, err := pm.runner.ProcessUIDs(); err != nil || uids[options.Uid] {
+		pm.mu.Unlock()
+		fuseDev.Close()
+		if err != nil {
+			klog.Errorf("Refusing to launch mount %s: cannot list the processes of UID %d: %v", mountId, options.Uid, err)
+		} else {
+			klog.Errorf("Refusing to launch mount %s: UID %d still has processes here", mountId, options.Uid)
+		}
+		return fmt.Errorf("refusing to launch mount %s: UID %d is already in use", mountId, options.Uid)
+	}
 	// Delete any error files that earlier Mountpoint of this PV wrote after node deletes error files.
 	// TODO if we add process to ensure Mountpoint exited, this should not be needed.
 	os.Remove(filepath.Join(pm.commDir, mountId+errorFileExt))
@@ -228,8 +283,15 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		}
 	}
 
-	handle, err := pm.runner.Start(cmd)
+	// csi-node writes a mount's credentials, owned by its UID, before we can refuse a busy UID; so it skips a UID while this exists.
+	marker := filepath.Join(pm.commDir, uidMarkerName(options.Uid))
+	err := os.WriteFile(marker, nil, uidMarkerPerm)
+	var handle ProcessHandle
+	if err == nil {
+		handle, err = pm.runner.Start(cmd)
+	}
 	if err != nil {
+		os.Remove(marker)
 		if cached {
 			if rmErr := pm.removeCacheVolumeEntry(dirName); rmErr != nil {
 				klog.Errorf("Failed to remove cache directory of mount %s after a failed start: %v", mountId, rmErr)
@@ -253,6 +315,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		defer pm.wg.Done()
 		exitCode, stderr := handle.Wait()
 
+		// For every exit, before the UID is freed: a process this Mountpoint left behind could read the next mount's credentials and cache.
+		if !pm.stopProcessesOfWithRetry(options.Uid) {
+			// Keep the UID and its marker: its processes die only with this mounter, and the next one removes the marker.
+			klog.Errorf("Mountpoint for mount %s exited with code %d; keeping UID %d, whose processes could not be stopped before shutdown", mountId, exitCode, options.Uid)
+			return
+		}
+
 		// Before freeing mountId and the UID, so a relaunch cannot create the directory this then removes.
 		if cached {
 			if err := pm.removeCacheVolumeEntry(dirName); err != nil {
@@ -266,6 +335,9 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 			pm.writeErrorFile(mountId, stderr)
 		}
 		delete(pm.processes, options.Uid)
+		if err := os.Remove(marker); err != nil {
+			klog.Errorf("Failed to remove %s, so csi-node will not hand out UID %d until the mounter restarts: %v", marker, options.Uid, err)
+		}
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
@@ -319,21 +391,31 @@ func (pm *ProcessManager) removeCacheVolumeEntry(name string) error {
 
 // emptyDirAs empties dir by running this binary as uid with no groups; any uid but root also drops every capability.
 func (pm *ProcessManager) emptyDirAs(dir string, uid uint32) error {
+	klog.Infof("Emptying cache directory %s as UID %d", dir, uid)
+	if err := pm.runHelper(context.Background(), uid, emptyDirArg, dir); err != nil {
+		return fmt.Errorf("failed to empty cache directory %q as UID %d: %w", dir, uid, err)
+	}
+	return nil
+}
+
+// runHelper runs this binary with args as uid, with no groups and no environment, and fails unless it exits cleanly before ctx ends.
+func (pm *ProcessManager) runHelper(ctx context.Context, uid uint32, args ...string) error {
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to find this binary to empty %q: %w", dir, err)
+		return fmt.Errorf("failed to find this binary: %w", err)
 	}
-	klog.Infof("Emptying cache directory %s as UID %d", dir, uid)
-	cmd := exec.Command(self, emptyDirArg, dir)
+	cmd := exec.CommandContext(ctx, self, args...)
+	// The context kills the helper, but Wait still waits for its stderr, which a process of the same UID can open from /proc.
+	cmd.WaitDelay = childWaitDelay
 	// No environment: a process of the same UID could read the helper's from /proc.
 	cmd.Env = []string{}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid, Groups: []uint32{}}}
 	handle, err := pm.runner.Start(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to empty cache directory %q as UID %d: %w", dir, uid, err)
+		return err
 	}
 	if exitCode, stderr := handle.Wait(); exitCode != 0 {
-		return fmt.Errorf("failed to empty cache directory %q as UID %d: exit status %d: %s", dir, uid, exitCode, bytes.TrimSpace(stderr))
+		return fmt.Errorf("exit status %d: %s", exitCode, bytes.TrimSpace(stderr))
 	}
 	return nil
 }
@@ -399,6 +481,89 @@ func (pm *ProcessManager) chownWithDefault(path string, uid, gid int) error {
 	return dir.Chown(uid, gid)
 }
 
+// uidMarkerName names the marker that exists while this mounter tracks a Mountpoint as uid.
+func uidMarkerName(uid uint32) string {
+	return uidMarkerPrefix + strconv.FormatUint(uint64(uid), 10)
+}
+
+// stopProcessesOfWithRetry retries stopProcessesOf with backoff until it succeeds, or until Shutdown starts.
+func (pm *ProcessManager) stopProcessesOfWithRetry(uid uint32) (stopped bool) {
+	for wait := stopRetryInterval; ; wait = min(2*wait, maxStopRetryInterval) {
+		err := pm.stopProcessesOf(uid)
+		if err == nil {
+			return true
+		}
+		// The caller still holds the UID, and with it its mount ID, so that PV cannot remount on this node meanwhile.
+		klog.Errorf("Failed to stop the processes of UID %d, retrying in %s: %v", uid, wait, err)
+		select {
+		case <-pm.shutdown:
+			return false
+		case <-time.After(wait):
+		}
+	}
+}
+
+// stopProcessesOf kills and reaps every process of uid in this PID namespace, and fails if any survive stopRounds kills. The caller
+// must own uid: its Mountpoint has been waited for and no other helper runs as uid, so the reap never takes a status Go waits for.
+func (pm *ProcessManager) stopProcessesOf(uid uint32) error {
+	if uid < mounter.UIDRangeStart || uid > mounter.UIDRangeEnd {
+		return fmt.Errorf("refusing to stop the processes of UID %d: not a Mountpoint UID", uid)
+	}
+	for round := 1; ; round++ {
+		uids, err := pm.runner.ProcessUIDs()
+		if err != nil {
+			return fmt.Errorf("failed to list processes: %w", err)
+		}
+		if !uids[uid] {
+			return nil
+		}
+		if round > stopRounds {
+			return fmt.Errorf("processes of UID %d are still running after %d kills", uid, stopRounds)
+		}
+		klog.Infof("Killing the processes of UID %d", uid)
+		ctx, cancel := context.WithTimeout(context.Background(), killHelperTimeout)
+		err = pm.runHelper(ctx, uid, killProcessesArg)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to kill the processes of UID %d: %w", uid, err)
+		}
+		time.Sleep(stopRoundPause)
+		reapOrphansOf(uid)
+	}
+}
+
+// runAsKillHelper kills every other process of its own UID in this PID namespace and exits, when stopProcessesOf started this
+// binary as the kill helper.
+func runAsKillHelper(args []string) {
+	if len(args) != 2 || args[1] != killProcessesArg {
+		return
+	}
+	// As root the helper keeps CAP_KILL, and outside the range its UID is not a Mountpoint's: kill(-1) would reach other processes.
+	if uid := os.Getuid(); uid < mounter.UIDRangeStart || uid > mounter.UIDRangeEnd {
+		fmt.Fprintf(os.Stderr, "refusing to kill processes as UID %d: not a Mountpoint UID\n", uid)
+		os.Exit(1)
+	}
+	// Reaches only what this UID may signal, i.e. its own processes in this PID namespace but not PID 1 or this one.
+	// Its result says nothing about that UID's processes, so the caller rescans.
+	syscall.Kill(-1, syscall.SIGKILL)
+	os.Exit(0)
+}
+
+// reapOrphansOf reaps the zombies of uid that were reparented to the mounter, which as PID 1 adopts every orphan in its namespace.
+func reapOrphansOf(uid uint32) {
+	processes, err := listProcesses()
+	if err != nil {
+		klog.Errorf("Failed to list the processes of UID %d to reap: %v", uid, err)
+		return
+	}
+	for _, p := range processes {
+		// Only our own zombie keeps its PID until we reap it; any other PID could be reused by a child Go waits for.
+		if p.zombie && p.ppid == os.Getpid() && slices.Contains(p.uids[:], uid) {
+			syscall.Wait4(p.pid, nil, syscall.WNOHANG, nil)
+		}
+	}
+}
+
 // writeErrorFile reports a mount failure to the driver, whose waitForMount polls for this file — the
 // only reply channel on the otherwise one-way mount socket.
 func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
@@ -411,6 +576,7 @@ func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
 
 // Shutdown sends SIGTERM to all processes and waits for them to exit.
 func (pm *ProcessManager) Shutdown() {
+	close(pm.shutdown)
 	pm.mu.Lock()
 	for _, p := range pm.processes {
 		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", p.mountId, p.handle.Pid())

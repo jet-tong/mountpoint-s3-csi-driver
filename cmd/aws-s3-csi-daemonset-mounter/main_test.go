@@ -50,3 +50,28 @@ func TestServe_ExitsWithoutListeningWhenTheCacheVolumeCannotBeLocked(t *testing.
 	assert.Contains(t, err.Error(), "cannot chown")
 	assertNotExist(t, sock)
 }
+
+func TestServe_RemovesStaleUIDMarkersBeforeListening(t *testing.T) {
+	commDir := t.TempDir()
+	pm := NewProcessManager(commDir, "", &fakeProcessRunner{}, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+	// What a mounter container that crashed leaves in the comm directory its pod keeps.
+	assert.NoError(t, os.WriteFile(filepath.Join(commDir, ".uid-65536"), nil, 0600))
+	errorFile := filepath.Join(commDir, "s3-pv.error")
+	assert.NoError(t, os.WriteFile(errorFile, []byte("boom"), 0600))
+	sock := filepath.Join(t.TempDir(), mountSockName)
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- serve(pm, sock, "/usr/bin/mount-s3", stop) }()
+
+	// The socket exists only once startup has run; 5s bounds the failing case.
+	waitAndAssert(t, "serve listened", 5*time.Second, func() bool {
+		_, err := os.Lstat(sock)
+		return err == nil
+	})
+	assertNotExist(t, filepath.Join(commDir, ".uid-65536"))
+	_, err := os.Stat(errorFile)
+	assert.NoError(t, err)
+
+	close(stop)
+	assert.NoError(t, <-done)
+}

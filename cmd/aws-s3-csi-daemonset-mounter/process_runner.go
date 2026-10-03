@@ -5,9 +5,16 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
 	"github.com/armon/circbuf"
 	"k8s.io/klog/v2"
@@ -20,9 +27,11 @@ type ProcessHandle interface {
 	Signal(sig os.Signal) error
 }
 
-// ProcessRunner starts a command and returns a handle to wait on it.
+// ProcessRunner starts a command and returns a handle to wait on it, and lists the processes in this PID namespace.
 type ProcessRunner interface {
 	Start(cmd *exec.Cmd) (ProcessHandle, error)
+	// ProcessUIDs returns every UID that has a process in this PID namespace, zombies included.
+	ProcessUIDs() (map[uint32]bool, error)
 }
 
 // defaultProcessRunner is the real implementation that starts OS processes.
@@ -44,6 +53,72 @@ func (r *defaultProcessRunner) Start(cmd *exec.Cmd) (ProcessHandle, error) {
 		return nil, err
 	}
 	return &defaultProcessHandle{cmd: cmd, stderrBuf: stderrBuf}, nil
+}
+
+func (r *defaultProcessRunner) ProcessUIDs() (map[uint32]bool, error) {
+	processes, err := listProcesses()
+	if err != nil {
+		return nil, err
+	}
+	uids := make(map[uint32]bool)
+	for _, p := range processes {
+		for _, uid := range p.uids {
+			uids[uid] = true
+		}
+	}
+	return uids, nil
+}
+
+// procStatus is what the mounter reads of a process from /proc/<pid>/status.
+type procStatus struct {
+	pid    int
+	ppid   int
+	zombie bool
+	uids   [3]uint32 // real, effective and saved
+}
+
+// listProcesses reads every process in this PID namespace, zombies included.
+func listProcesses() ([]procStatus, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	var processes []procStatus
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		status, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			continue // reaped since the listing
+		}
+		if err != nil {
+			return nil, err
+		}
+		field := func(name string) string {
+			_, value, _ := strings.Cut(string(status), "\n"+name+":")
+			value, _, _ = strings.Cut(value, "\n")
+			return strings.TrimSpace(value)
+		}
+		p := procStatus{pid: pid, zombie: strings.HasPrefix(field("State"), "Z")}
+		if p.ppid, err = strconv.Atoi(field("PPid")); err != nil {
+			return nil, fmt.Errorf("unexpected PPid in /proc/%d/status: %w", pid, err)
+		}
+		uids := strings.Fields(field("Uid"))
+		if len(uids) < 3 {
+			return nil, fmt.Errorf("no real, effective and saved UID in /proc/%d/status", pid)
+		}
+		for i, value := range uids[:3] {
+			uid, err := strconv.ParseUint(value, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("unexpected UID %q in /proc/%d/status: %w", value, pid, err)
+			}
+			p.uids[i] = uint32(uid)
+		}
+		processes = append(processes, p)
+	}
+	return processes, nil
 }
 
 type defaultProcessHandle struct {

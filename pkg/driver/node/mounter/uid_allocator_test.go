@@ -2,6 +2,7 @@ package mounter_test
 
 import (
 	"math"
+	"os"
 	"sync"
 	"testing"
 
@@ -12,10 +13,11 @@ import (
 func TestUIDAllocator(t *testing.T) {
 	t.Run("Hands out unique UIDs from within the range", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 		seen := make(map[uint32]struct{})
 
 		for range 1000 {
-			uid, err := a.Allocate()
+			uid, err := a.Allocate(commDir)
 			assert.NoError(t, err)
 
 			if uid < mounter.UIDRangeStart || uid > mounter.UIDRangeEnd {
@@ -30,30 +32,32 @@ func TestUIDAllocator(t *testing.T) {
 
 	t.Run("Reuses a released UID rather than failing when the range is full", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 		allocateAll(t, a)
 
 		// With everything taken, the next allocation must fail and return a value no caller could
 		// mistake for a UID.
-		exhausted, err := a.Allocate()
+		exhausted, err := a.Allocate(commDir)
 		assert.ErrorIs(t, err, mounter.ErrUIDRangeExhausted)
 		assert.Equals(t, uint32(math.MaxUint32), exhausted)
 
 		// Freeing one makes exactly that UID available again.
 		a.Release(mounter.UIDRangeStart + 42)
-		uid, err := a.Allocate()
+		uid, err := a.Allocate(commDir)
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(mounter.UIDRangeStart+42), uid)
 
-		_, err = a.Allocate()
+		_, err = a.Allocate(commDir)
 		assert.ErrorIs(t, err, mounter.ErrUIDRangeExhausted)
 	})
 
 	t.Run("Wraps past the end of the range to find a free UID", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 
 		// Take the bottom of the range so the cursor moves off it, then reserve everything above so the
 		// only free UID is the one behind the cursor. Reaching it requires wrapping past the end.
-		bottom, err := a.Allocate()
+		bottom, err := a.Allocate(commDir)
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(mounter.UIDRangeStart), bottom)
 
@@ -62,13 +66,14 @@ func TestUIDAllocator(t *testing.T) {
 		}
 		a.Release(bottom)
 
-		uid, err := a.Allocate()
+		uid, err := a.Allocate(commDir)
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(mounter.UIDRangeStart), uid)
 	})
 
 	t.Run("Does not reallocate a reserved UID", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 		seeded := uint32(mounter.UIDRangeStart + 5)
 		assert.NoError(t, a.Reserve(seeded))
 
@@ -76,13 +81,13 @@ func TestUIDAllocator(t *testing.T) {
 
 		// A new allocator starts at the bottom of the range, so the loop below scans upwards over the
 		// reserved value rather than away from it.
-		first, err := a.Allocate()
+		first, err := a.Allocate(commDir)
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(mounter.UIDRangeStart), first)
 
 		// Enough allocations to scan well past the reserved value.
 		for range 10 {
-			uid, err := a.Allocate()
+			uid, err := a.Allocate(commDir)
 			assert.NoError(t, err)
 			if uid == seeded {
 				t.Fatalf("reallocated reserved UID %d", seeded)
@@ -92,6 +97,7 @@ func TestUIDAllocator(t *testing.T) {
 
 	t.Run("Rejects reservations outside the range", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 
 		// These arrive from a meta file on disk, so a zero or out-of-range value is possible. The
 		// caller is told rather than left to assume the reservation took effect.
@@ -100,13 +106,31 @@ func TestUIDAllocator(t *testing.T) {
 			assert.Equals(t, false, a.InUse(uid))
 		}
 
-		uid, err := a.Allocate()
+		uid, err := a.Allocate(commDir)
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(mounter.UIDRangeStart), uid)
 	})
 
+	t.Run("Treats a UID whose marker it cannot check as in use", func(t *testing.T) {
+		// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case.
+		assert.Equals(t, false, os.Geteuid() == 0)
+		a := mounter.NewUIDAllocator()
+		// Only the bottom UID is free, so one stat decides rather than one per UID in the range.
+		for uid := uint32(mounter.UIDRangeStart + 1); uid <= mounter.UIDRangeEnd; uid++ {
+			assert.NoError(t, a.Reserve(uid))
+		}
+		// Not searchable, so every stat inside fails with permission denied rather than not-exist.
+		commDir := t.TempDir()
+		assert.NoError(t, os.Chmod(commDir, 0600))
+		t.Cleanup(func() { os.Chmod(commDir, 0700) })
+
+		_, err := a.Allocate(commDir)
+		assert.ErrorIs(t, err, mounter.ErrUIDRangeExhausted)
+	})
+
 	t.Run("Concurrent allocations never collide", func(t *testing.T) {
 		a := mounter.NewUIDAllocator()
+		commDir := t.TempDir()
 
 		const goroutines = 50
 		const perGoroutine = 20
@@ -119,7 +143,7 @@ func TestUIDAllocator(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for range perGoroutine {
-					uid, err := a.Allocate()
+					uid, err := a.Allocate(commDir)
 					if err != nil {
 						t.Errorf("unexpected allocation failure: %v", err)
 						return
@@ -146,8 +170,9 @@ func TestUIDAllocator(t *testing.T) {
 // allocateAll claims every UID in the range.
 func allocateAll(t *testing.T, a *mounter.UIDAllocator) {
 	t.Helper()
+	commDir := t.TempDir()
 	for range mounter.UIDRangeEnd - mounter.UIDRangeStart + 1 {
-		if _, err := a.Allocate(); err != nil {
+		if _, err := a.Allocate(commDir); err != nil {
 			t.Fatalf("failed to fill the range: %v", err)
 		}
 	}

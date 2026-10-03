@@ -362,7 +362,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 		// Claim the UID this mount's Mountpoint will run as. Releasing first so that an entry that
 		// already failed once does not leak the UID it claimed then; a no-op for a new entry.
 		dm.uidAllocator.Release(entry.Uid)
-		uid, err := dm.uidAllocator.Allocate()
+		uid, err := dm.uidAllocator.Allocate(entry.CommDir)
 		if err != nil {
 			return fmt.Errorf("failed to allocate a UID for volume %s: %w", volumeID, err)
 		}

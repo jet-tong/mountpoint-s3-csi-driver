@@ -503,7 +503,7 @@ func TestRebuildMountMap_RestoresUIDs(t *testing.T) {
 
 		// Nothing was reserved, so the allocator is still untouched: the first UID it issues is the
 		// bottom of the range.
-		uid, err := dm.uidAllocator.Allocate()
+		uid, err := dm.uidAllocator.Allocate(t.TempDir())
 		assert.NoError(t, err)
 		assert.Equals(t, uint32(UIDRangeStart), uid)
 	})
