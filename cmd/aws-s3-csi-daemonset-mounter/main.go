@@ -127,17 +127,16 @@ func main() {
 	}
 }
 
-// serve locks and empties the cache volume, handles mount requests on sockPath until stop closes, then stops every
-// Mountpoint and empties the cache volume again.
+// serve locks the cache volume and starts removing its leftovers, handles mount requests on sockPath until stop closes,
+// then stops every Mountpoint and empties the cache volume.
 func serve(pm *ProcessManager, sockPath, mountpointPath string, stop <-chan struct{}) error {
 	if err := pm.secureCacheVolume(); err != nil {
 		return err
 	}
 
 	// Clean up cache directories after startup, to remove any leftover cache directories from previous mounter pod crash.
-	// A directory that cannot be removed fails only the next launch as its UID, which retries the removal, to limit
-	// blast radius of a failed cleanup.
-	if err := pm.emptyCacheVolume(); err != nil {
+	// They are removed in the background, so mounts are served at once; launches as their UIDs are refused until then.
+	if err := pm.releaseLeftovers(); err != nil {
 		klog.Errorf("Some leftover cache directories remain: %v", err)
 	}
 

@@ -59,6 +59,11 @@ type fakeProcessRunner struct {
 	startErr   error       // when set, Start fails instead of spawning
 	helperCmds []*exec.Cmd // the removal helpers started, which run in-process as the test user
 	helperErr  error       // when set, every removal helper fails instead of emptying
+
+	helperFailures   int           // the next this-many removal helpers fail, then the rest empty
+	helperGate       chan struct{} // when set, a removal helper waits for it to close, or for a signal
+	helperUnkillable bool          // when set, a gated helper ignores signals, as one in uninterruptible sleep does
+	helperStarted    chan struct{} // when set, receives as a removal helper starts, if it has room
 }
 
 func (r *fakeProcessRunner) Start(cmd *exec.Cmd) (ProcessHandle, error) {
@@ -88,14 +93,36 @@ func (r *fakeProcessRunner) Start(cmd *exec.Cmd) (ProcessHandle, error) {
 
 func (r *fakeProcessRunner) runHelper(cmd *exec.Cmd) ProcessHandle {
 	r.helperCmds = append(r.helperCmds, cmd)
-	h := &fakeProcessHandle{done: make(chan struct{})}
-	if r.helperErr != nil {
-		h.Exit(1, r.helperErr.Error())
-	} else if err := emptyDirAsOwner(cmd.Args[2]); err != nil {
-		h.Exit(1, err.Error())
-	} else {
-		h.Exit(0, "")
+	h := &fakeProcessHandle{done: make(chan struct{}), sigCh: make(chan os.Signal, 1)}
+	failure := r.helperErr
+	if failure == nil && r.helperFailures > 0 {
+		r.helperFailures--
+		failure = errors.New("permission denied")
 	}
+	select {
+	case r.helperStarted <- struct{}{}:
+	default:
+	}
+	// In the background, as Start returns before a real helper is done.
+	go func(gate chan struct{}, unkillable bool) {
+		if gate != nil && unkillable {
+			<-gate
+		} else if gate != nil {
+			select {
+			case <-gate:
+			case <-h.sigCh:
+				h.Exit(137, "killed")
+				return
+			}
+		}
+		if failure != nil {
+			h.Exit(1, failure.Error())
+		} else if err := emptyDirAsOwner(cmd.Args[2]); err != nil {
+			h.Exit(1, err.Error())
+		} else {
+			h.Exit(0, "")
+		}
+	}(r.helperGate, r.helperUnkillable)
 	return h
 }
 
@@ -136,6 +163,21 @@ func assertNotExist(t *testing.T, path string) {
 	t.Helper()
 	_, err := os.Lstat(path)
 	assert.Equals(t, true, errors.Is(err, fs.ErrNotExist))
+}
+
+// launchWithin launches a mount, failing t unless Launch returns within 2s; that bounds only the failing case, where
+// Launch waits for a removal helper.
+func launchWithin(t *testing.T, pm *ProcessManager, mountId string, options mountoptions.Options) error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- pm.Launch(mountId, "/usr/bin/mount-s3", options) }()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Launch of mount %s did not return while a removal helper was running", mountId)
+		return nil
+	}
 }
 
 // --- Tests ---
@@ -226,72 +268,41 @@ func TestProcessManager_SecureCacheVolume(t *testing.T) {
 	})
 }
 
-func TestProcessManager_EmptyCacheVolume(t *testing.T) {
-	t.Run("removes every entry in the cache volume, with its contents", func(t *testing.T) {
-		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
-		blockDir := filepath.Join(cacheDir, "pv-a", "mountpoint-cache", "V2", "ab")
-		assert.NoError(t, os.MkdirAll(blockDir, 0700))
-		assert.NoError(t, os.WriteFile(filepath.Join(blockDir, "block"), []byte("x"), 0600))
-		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "pv-b"), 0700))
-		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "lost+found"), 0700))
-		strayFile := filepath.Join(cacheDir, "stray-file")
-		assert.NoError(t, os.WriteFile(strayFile, []byte("x"), 0600))
+func TestProcessManager_ReleaseLeftovers(t *testing.T) {
+	t.Run("leaves an entry whose UID another entry already ties up", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"), 0700))
+		// As an earlier entry owned by 65536 would have; tests cannot chown one to set that up.
+		pm.processes[65536] = mountpointProcess{}
 
-		assert.NoError(t, pm.emptyCacheVolume())
+		assert.NoError(t, pm.releaseLeftovers())
+		pm.Shutdown()
 
-		entries, err := os.ReadDir(cacheDir)
+		_, err := os.Stat(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"))
 		assert.NoError(t, err)
-		assert.Equals(t, 0, len(entries))
+		assert.Equals(t, 0, len(fr.helperCmds))
 	})
+}
 
-	t.Run("removes a symlink without touching its target", func(t *testing.T) {
-		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
-		outside := t.TempDir()
-		target := filepath.Join(outside, "keep")
-		assert.NoError(t, os.WriteFile(target, []byte("x"), 0600))
-		assert.NoError(t, os.Symlink(outside, filepath.Join(cacheDir, "pv-link")))
-
-		assert.NoError(t, pm.emptyCacheVolume())
-
-		assertNotExist(t, filepath.Join(cacheDir, "pv-link"))
-		_, err := os.Lstat(target)
-		assert.NoError(t, err)
-	})
-
-	t.Run("names an entry it cannot remove, with the reason, and still removes the others", func(t *testing.T) {
-		// The helper fails as it would on a subtree another UID owns, which an unprivileged test cannot create.
-		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{helperErr: errors.New("permission denied")}, cacheLimit{strategy: cacheLimitNone})
-		stuck := filepath.Join(cacheDir, "pv-stuck", "mountpoint-cache")
-		assert.NoError(t, os.MkdirAll(stuck, 0700))
-		assert.NoError(t, os.WriteFile(filepath.Join(stuck, "block"), []byte("x"), 0600))
-		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "pv-a"), 0700))
-
-		err := pm.emptyCacheVolume()
-		if err == nil {
-			t.Fatal("expected an error for the entry it could not remove")
-		}
-		assert.Contains(t, err.Error(), "permission denied")
-		assert.Contains(t, err.Error(), "still holds [pv-stuck] after cleanup")
-		assertNotExist(t, filepath.Join(cacheDir, "pv-a"))
-	})
-
-	t.Run("fails when the cache volume cannot be listed", func(t *testing.T) {
-		pm := NewProcessManager(t.TempDir(), filepath.Join(t.TempDir(), "missing"), &fakeProcessRunner{},
-			memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
-
-		err := pm.emptyCacheVolume()
-		if err == nil {
-			t.Fatal("expected an error for a cache volume that cannot be listed")
-		}
-		assert.Contains(t, err.Error(), "failed to list cache volume")
-	})
-
-	t.Run("does nothing without a cache volume", func(t *testing.T) {
-		pm := NewProcessManager(t.TempDir(), "", &fakeProcessRunner{}, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
-
-		// Note: without the "" check this would fail listing the working directory's empty path.
-		assert.NoError(t, pm.emptyCacheVolume())
-	})
+func TestUIDsOf(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		entry string
+		owner uint32
+		want  []uint32
+	}{
+		{"a mount's directory, owned by its UID", "uid-65537", 65537, []uint32{65537}},
+		{"a mount's directory owned by another UID ties up both", "uid-65537", 65538, []uint32{65538, 65537}},
+		{"any other name owned by a UID in the range", "lost+found", 65537, []uint32{65537}},
+		{"a root-owned entry", "lost+found", 0, nil},
+		{"a name mountCacheDirName does not write", "uid-065537", 1000, nil},
+		{"a name for a UID outside the range", "uid-1", 1000, nil},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equals(t, testCase.want, uidsOf(testCase.entry, testCase.owner))
+		})
+	}
 }
 
 func TestProcessManager_Launch_HappyPath(t *testing.T) {
@@ -526,24 +537,6 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		pm.Shutdown()
 	})
 
-	t.Run("replaces a leftover directory with an empty one", func(t *testing.T) {
-		fr := &fakeProcessRunner{}
-		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
-		// What an earlier mount as this UID left when its removal failed.
-		leftoverBlock := filepath.Join(cacheDir, dirName, "mountpoint-cache", "block")
-		assert.NoError(t, os.MkdirAll(filepath.Dir(leftoverBlock), 0700))
-		assert.NoError(t, os.WriteFile(leftoverBlock, []byte("x"), 0600))
-
-		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", cachedOptions(t)))
-
-		entries, err := os.ReadDir(filepath.Join(cacheDir, dirName))
-		assert.NoError(t, err)
-		assert.Equals(t, 0, len(entries))
-
-		fr.handles[0].Exit(0, "")
-		pm.Shutdown()
-	})
-
 	t.Run("replaces a symlink left at the mount's path without touching its target", func(t *testing.T) {
 		fr := &fakeProcessRunner{}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
@@ -581,25 +574,41 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		pm.Shutdown()
 	})
 
-	t.Run("removes what its UID left behind before an uncached launch too", func(t *testing.T) {
-		fr := &fakeProcessRunner{}
+	t.Run("refuses a launch, uncached too, while what its UID left behind is removed in the background, and serves other UIDs meanwhile", func(t *testing.T) {
+		fr := &fakeProcessRunner{helperGate: make(chan struct{})}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
 		// What a killed Mountpoint of an earlier mount as this UID left behind, and another UID's.
 		leftoverBlock := filepath.Join(cacheDir, dirName, "mountpoint-cache", "block")
 		assert.NoError(t, os.MkdirAll(filepath.Dir(leftoverBlock), 0700))
 		assert.NoError(t, os.WriteFile(leftoverBlock, []byte("x"), 0600))
 		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "uid-65537"), 0700))
-		options := cachedOptions(t)
-		options.Args = nil
+		uncachedOptions := func(uid uint32) mountoptions.Options {
+			options := cachedOptions(t)
+			options.Args = nil
+			options.Uid, options.Gid = uid, uid
+			return options
+		}
 
-		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", options))
-
-		assertNotExist(t, filepath.Join(cacheDir, dirName))
-		_, err := os.Stat(filepath.Join(cacheDir, "uid-65537"))
+		err := launchWithin(t, pm, mountId, uncachedOptions(65536))
+		if err == nil {
+			t.Fatal("expected a launch as a UID whose leftover is not removed yet to be refused")
+		}
+		assert.Contains(t, err.Error(), "UID 65536 is already in use by another mount")
+		// Before the launch as 65537, which removes its own leftover.
+		_, err = os.Stat(filepath.Join(cacheDir, "uid-65537"))
 		assert.NoError(t, err)
+		pm.mu.Lock()
+		_, releasing := pm.processes[65536]
+		pm.mu.Unlock()
+		assert.Equals(t, true, releasing)
+		assert.NoError(t, launchWithin(t, pm, "other-pv", uncachedOptions(65537)))
+		assert.Equals(t, 1, len(fr.handles))
 
+		close(fr.helperGate)
 		fr.handles[0].Exit(0, "")
 		pm.Shutdown()
+		assertNotExist(t, filepath.Join(cacheDir, dirName))
+		assert.Equals(t, 0, len(pm.processes))
 	})
 
 	t.Run("leaves a running mount's directory alone when a duplicate or another mount with its UID arrives", func(t *testing.T) {
@@ -652,9 +661,14 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 	})
 
 	t.Run("fails without starting Mountpoint when what its UID left behind cannot be removed, and releases the mount", func(t *testing.T) {
-		fr := &fakeProcessRunner{helperErr: errors.New("permission denied")}
+		// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case.
+		assert.Equals(t, false, os.Geteuid() == 0)
+		fr := &fakeProcessRunner{}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
-		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, dirName, "mountpoint-cache"), 0700))
+		// An empty leftover on a read-only cache volume: its removal fails with something other than "not empty".
+		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, dirName), 0700))
+		assert.NoError(t, os.Chmod(cacheDir, 0500))
+		t.Cleanup(func() { os.Chmod(cacheDir, 0700) })
 
 		err := pm.Launch(mountId, "/usr/bin/mount-s3", cachedOptions(t))
 		if err == nil {
@@ -666,9 +680,7 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		assert.Equals(t, 0, len(fr.handles))
 
 		// A retry must get the lock, and starts once the leftover can be removed.
-		fr.mu.Lock()
-		fr.helperErr = nil
-		fr.mu.Unlock()
+		assert.NoError(t, os.Chmod(cacheDir, 0700))
 		options := cachedOptions(t)
 		retried := make(chan error, 1)
 		go func() { retried <- pm.Launch(mountId, "/usr/bin/mount-s3", options) }()
@@ -717,13 +729,24 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		pm.Shutdown()
 	})
 
-	t.Run("removes the directory when Mountpoint fails to start", func(t *testing.T) {
-		fr := &fakeProcessRunner{startErr: errors.New("fork/exec: no such file")}
+	t.Run("removes the directory when Mountpoint fails to start, and keeps its UID until then", func(t *testing.T) {
+		fr := &fakeProcessRunner{startErr: errors.New("fork/exec: no such file"), helperGate: make(chan struct{})}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		// As a leftover process of the UID could, so the removal needs the held helper and the test can look meanwhile.
+		pm.chown = func(path string, _, _ int) error {
+			return os.WriteFile(filepath.Join(path, "block"), []byte("x"), 0600)
+		}
 
 		if err := pm.Launch(mountId, "/usr/bin/mount-s3", cachedOptions(t)); err == nil {
 			t.Fatal("expected Launch to fail when the process cannot start")
 		}
+		pm.mu.Lock()
+		_, releasing := pm.processes[65536]
+		pm.mu.Unlock()
+		assert.Equals(t, true, releasing)
+
+		close(fr.helperGate)
+		pm.Shutdown()
 		assertNotExist(t, filepath.Join(cacheDir, dirName))
 	})
 
@@ -742,25 +765,35 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		assertNotExist(t, filepath.Join(cacheDir, dirName))
 	})
 
-	t.Run("keeps the mount claimed until its directory is removed", func(t *testing.T) {
-		fr := &fakeProcessRunner{}
+	t.Run("frees the mount ID as soon as Mountpoint exits, and keeps its UID until the directory is removed", func(t *testing.T) {
+		fr := &fakeProcessRunner{helperGate: make(chan struct{}), helperStarted: make(chan struct{}, 1)}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
-		mountCacheDir := filepath.Join(cacheDir, dirName)
 		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", cachedOptions(t)))
+		// A killed Mountpoint leaves its blocks behind.
+		assert.NoError(t, os.WriteFile(filepath.Join(cacheDir, dirName, "block"), []byte("x"), 0600))
 
-		// While we hold the lock, the waiter cannot free the mount ID, so the directory must be removed before that.
-		pm.mu.Lock()
-		fr.handles[0].Exit(1, "boom!")
-		dirGone := false
-		// 2s only bounds the failing case.
-		for deadline := time.Now().Add(2 * time.Second); !dirGone && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			_, err := os.Lstat(mountCacheDir)
-			dirGone = errors.Is(err, fs.ErrNotExist)
+		fr.handles[0].Exit(137, "")
+		select {
+		case <-fr.helperStarted:
+		// 2s bounds only the failing case.
+		case <-time.After(2 * time.Second):
+			t.Fatal("the exited Mountpoint's directory was not being removed")
 		}
-		pm.mu.Unlock()
-		assert.Equals(t, true, dirGone)
 
+		// The node's retry for the same PV carries a new UID.
+		retry := cachedOptions(t)
+		retry.Uid, retry.Gid = 65537, 65537
+		assert.NoError(t, launchWithin(t, pm, mountId, retry))
+		pm.mu.Lock()
+		exited, releasing := pm.processes[65536]
+		pm.mu.Unlock()
+		assert.Equals(t, true, releasing)
+		assert.Equals(t, nil, exited.handle)
+
+		close(fr.helperGate)
+		fr.handles[1].Exit(0, "")
 		pm.Shutdown()
+		assertNotExist(t, filepath.Join(cacheDir, dirName))
 	})
 }
 
@@ -927,6 +960,64 @@ func TestProcessManager_Launch_DuplicateUID_Rejected(t *testing.T) {
 	pm.Shutdown()
 }
 
+func TestProcessManager_Launch_RefusesAUIDStillBeingReleased(t *testing.T) {
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(t.TempDir(), "", fr, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+	// Releasing with no directory left, so the UID check alone must refuse it.
+	pm.processes[65536] = mountpointProcess{}
+	dev := mountertest.OpenDevNull(t)
+
+	err := pm.Launch("mount-b", "/usr/bin/mount-s3", mountoptions.Options{Fd: int(dev.Fd()), BucketName: "bucket", Uid: 65536, Gid: 65536})
+	if err == nil {
+		t.Fatal("expected a launch as a Releasing UID to be refused")
+	}
+	assert.Contains(t, err.Error(), "UID 65536 is already in use by another mount")
+	assert.Equals(t, 0, len(fr.handles))
+}
+
+func TestProcessManager_Release(t *testing.T) {
+	t.Run("retries a failed removal until it succeeds, then frees every UID it held", func(t *testing.T) {
+		fr := &fakeProcessRunner{helperFailures: 2}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		pm.releaseRetryDelay = 10 * time.Millisecond
+		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"), 0700))
+		// As startup marks a directory whose owner is not the UID in its name.
+		l := leftover{name: "uid-65536", uids: []uint32{65536, 65537}}
+		pm.markReleasing(l)
+
+		start := time.Now()
+		pm.release(l)
+
+		// A lower bound only: 10ms then 20ms, where a delay that never grows waits 20ms.
+		assert.Equals(t, true, time.Since(start) >= 30*time.Millisecond)
+		assertNotExist(t, filepath.Join(cacheDir, "uid-65536"))
+		assert.Equals(t, 3, len(fr.helperCmds))
+		assert.Equals(t, 0, len(pm.processes))
+		assert.Equals(t, 0, len(pm.releasing))
+	})
+
+	t.Run("stops retrying once shutdown starts, and keeps its UID Releasing", func(t *testing.T) {
+		fr := &fakeProcessRunner{helperErr: errors.New("permission denied")}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		pm.releaseRetryDelay = 10 * time.Millisecond
+		// Shutdown returns at this bound only if the release kept retrying through its wait.
+		pm.shutdownTimeout = 2 * time.Second
+		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"), 0700))
+		l := leftover{name: "uid-65536", uids: []uint32{65536}}
+		pm.mu.Lock()
+		pm.markReleasing(l)
+		pm.startRelease(l)
+		pm.mu.Unlock()
+
+		start := time.Now()
+		pm.Shutdown()
+
+		assert.Equals(t, true, time.Since(start) < pm.shutdownTimeout)
+		_, releasing := pm.processes[65536]
+		assert.Equals(t, true, releasing)
+	})
+}
+
 func TestProcessManager_RemoveCacheVolumeEntry(t *testing.T) {
 	t.Run("removes an empty directory itself, without the helper", func(t *testing.T) {
 		fr := &fakeProcessRunner{}
@@ -980,6 +1071,51 @@ func TestProcessManager_RemoveCacheVolumeEntry(t *testing.T) {
 			t.Fatal("expected removeCacheVolumeEntry to fail when the helper fails")
 		}
 		assert.Contains(t, err.Error(), "permission denied")
+	})
+
+	t.Run("kills a helper still running at its deadline, and fails", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{helperGate: make(chan struct{})}, cacheLimit{strategy: cacheLimitNone})
+		pm.removalHelperTimeout = 50 * time.Millisecond
+		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"), 0700))
+
+		removed := make(chan error, 1)
+		go func() { removed <- pm.removeCacheVolumeEntry("uid-65536") }()
+		select {
+		case err := <-removed:
+			if err == nil {
+				t.Fatal("expected removeCacheVolumeEntry to fail when its helper overruns its deadline")
+			}
+			assert.Contains(t, err.Error(), "still running after 50ms")
+		// 2s bounds only the failing case, where the helper is never killed.
+		case <-time.After(2 * time.Second):
+			t.Fatal("removeCacheVolumeEntry did not return after its helper's deadline")
+		}
+	})
+
+	t.Run("waits for a helper it killed, so a retry never runs a second one beside it", func(t *testing.T) {
+		fr := &fakeProcessRunner{helperGate: make(chan struct{}), helperUnkillable: true}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		pm.removalHelperTimeout = 50 * time.Millisecond
+		assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "uid-65536", "mountpoint-cache"), 0700))
+
+		removed := make(chan error, 1)
+		go func() { removed <- pm.removeCacheVolumeEntry("uid-65536") }()
+		select {
+		case <-removed:
+			t.Fatal("removeCacheVolumeEntry returned while the helper it killed still ran")
+		// Four times the deadline, so one that does not wait has returned by then.
+		case <-time.After(200 * time.Millisecond):
+		}
+		close(fr.helperGate)
+		select {
+		case err := <-removed:
+			if err == nil {
+				t.Fatal("expected removeCacheVolumeEntry to fail when its helper overruns its deadline")
+			}
+		// 2s bounds only the failing case.
+		case <-time.After(2 * time.Second):
+			t.Fatal("removeCacheVolumeEntry did not return once its killed helper ended")
+		}
 	})
 
 	t.Run("fails when the mounter has no cache volume", func(t *testing.T) {
@@ -1092,6 +1228,8 @@ func TestProcessManager_Shutdown_SendsSIGTERM(t *testing.T) {
 		BucketName: "b",
 	})
 	assert.NoError(t, err)
+	// A Releasing UID has no Mountpoint to signal.
+	pm.processes[65537] = mountpointProcess{}
 
 	go func() {
 		select {
@@ -1105,6 +1243,100 @@ func TestProcessManager_Shutdown_SendsSIGTERM(t *testing.T) {
 	}()
 
 	pm.Shutdown()
+}
+
+func TestProcessManager_EmptyCacheVolume(t *testing.T) {
+	t.Run("removes every entry in the cache volume, with its contents", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		blockDir := filepath.Join(cacheDir, "pv-a", "mountpoint-cache", "V2", "ab")
+		assert.NoError(t, os.MkdirAll(blockDir, 0700))
+		assert.NoError(t, os.WriteFile(filepath.Join(blockDir, "block"), []byte("x"), 0600))
+		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "pv-b"), 0700))
+		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "lost+found"), 0700))
+		strayFile := filepath.Join(cacheDir, "stray-file")
+		assert.NoError(t, os.WriteFile(strayFile, []byte("x"), 0600))
+
+		assert.NoError(t, pm.emptyCacheVolume())
+
+		entries, err := os.ReadDir(cacheDir)
+		assert.NoError(t, err)
+		assert.Equals(t, 0, len(entries))
+	})
+
+	t.Run("removes a symlink without touching its target", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		outside := t.TempDir()
+		target := filepath.Join(outside, "keep")
+		assert.NoError(t, os.WriteFile(target, []byte("x"), 0600))
+		assert.NoError(t, os.Symlink(outside, filepath.Join(cacheDir, "pv-link")))
+
+		assert.NoError(t, pm.emptyCacheVolume())
+
+		assertNotExist(t, filepath.Join(cacheDir, "pv-link"))
+		_, err := os.Lstat(target)
+		assert.NoError(t, err)
+	})
+
+	t.Run("names an entry it cannot remove, with the reason, and still removes the others", func(t *testing.T) {
+		// The helper fails as it would on a subtree another UID owns, which an unprivileged test cannot create.
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{helperErr: errors.New("permission denied")}, cacheLimit{strategy: cacheLimitNone})
+		stuck := filepath.Join(cacheDir, "pv-stuck", "mountpoint-cache")
+		assert.NoError(t, os.MkdirAll(stuck, 0700))
+		assert.NoError(t, os.WriteFile(filepath.Join(stuck, "block"), []byte("x"), 0600))
+		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "pv-a"), 0700))
+
+		err := pm.emptyCacheVolume()
+		if err == nil {
+			t.Fatal("expected an error for the entry it could not remove")
+		}
+		assert.Contains(t, err.Error(), "permission denied")
+		assert.Contains(t, err.Error(), "still holds [pv-stuck] after cleanup")
+		assertNotExist(t, filepath.Join(cacheDir, "pv-a"))
+	})
+
+	t.Run("skips and names what a UID still in use or a release still holds", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		for _, name := range []string{"uid-65536", "lost+found"} {
+			assert.NoError(t, os.MkdirAll(filepath.Join(cacheDir, name, "x"), 0700))
+		}
+		assert.NoError(t, os.Mkdir(filepath.Join(cacheDir, "pv-a"), 0700))
+		pm.processes[65536] = mountpointProcess{}
+		// Root-owned in production, so it ties up no UID.
+		pm.releasing["lost+found"] = true
+
+		err := pm.emptyCacheVolume()
+		if err == nil {
+			t.Fatal("expected an error naming the entries it skipped")
+		}
+		// Note: TestServe also fails without the skip, but only as a timeout; this names it.
+		assert.Contains(t, err.Error(), `skipped cache volume entry "uid-65536": a Mountpoint or its removal still holds it`)
+		assert.Contains(t, err.Error(), `skipped cache volume entry "lost+found": a Mountpoint or its removal still holds it`)
+		for _, name := range []string{"uid-65536", "lost+found"} {
+			_, err = os.Stat(filepath.Join(cacheDir, name, "x"))
+			assert.NoError(t, err)
+		}
+		assert.Equals(t, 0, len(fr.helperCmds))
+		assertNotExist(t, filepath.Join(cacheDir, "pv-a"))
+	})
+
+	t.Run("fails when the cache volume cannot be listed", func(t *testing.T) {
+		pm := NewProcessManager(t.TempDir(), filepath.Join(t.TempDir(), "missing"), &fakeProcessRunner{},
+			memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		err := pm.emptyCacheVolume()
+		if err == nil {
+			t.Fatal("expected an error for a cache volume that cannot be listed")
+		}
+		assert.Contains(t, err.Error(), "failed to list cache volume")
+	})
+
+	t.Run("does nothing without a cache volume", func(t *testing.T) {
+		pm := NewProcessManager(t.TempDir(), "", &fakeProcessRunner{}, memoryLimit{strategy: memoryLimitNone}, cacheLimit{strategy: cacheLimitNone})
+
+		// Note: without the "" check this would fail listing the working directory's empty path.
+		assert.NoError(t, pm.emptyCacheVolume())
+	})
 }
 
 // TestHandleConnection_NoFdLeak verifies that handleConnection does not leak file descriptors
