@@ -131,11 +131,14 @@ delete_eks_cluster() {
 
 deploy_helm_chart() {
     local ecr_repository_url=$(get_ecr_repository_url)
-    local mounterMode="${MOUNTPOINT_CSI_DRIVER_MODE:-pod}" # or daemonset
+    local mounterMode="${MOUNTPOINT_CSI_MOUNTER_MODE:-daemonset}" # or pod
 
-    echo "deploying Helm chart (mounterMode=${mounterMode})..."
+    echo "deploying Helm chart (mounterMode=${mounterMode}, cache sizeLimit=${cacheSizeLimit})..."
+    # --values is load-bearing: `--set daemonsetMounters[0].<field>` replaces the whole list element,
+    # so without it maxVolumesPerNode, resources and logLevel are all lost and the render fails.
     helm upgrade --install aws-mountpoint-s3-csi-driver \
         --namespace kube-system \
+        --values ./charts/aws-mountpoint-s3-csi-driver/values.yaml \
         --set unsupportedDevInstall=true \
         --set image.repository="${ecr_repository_url}" \
         --set image.pullPolicy=Always \

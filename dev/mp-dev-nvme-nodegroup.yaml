@@ -1,0 +1,37 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+# A node with an NVMe instance-store disk, for the `ephemeral` cache on the Local Volume Static Provisioner.
+# It costs money for as long as it exists, so delete it when done:
+#   eksctl create nodegroup -f dev/mp-dev-nvme-nodegroup.yaml
+#   eksctl delete nodegroup -f dev/mp-dev-nvme-nodegroup.yaml --approve
+metadata:
+  name: mp-dev-cluster
+  region: eu-north-1
+
+managedNodeGroups:
+  - name: ng-nvme
+    # The cheapest type in eu-north-1 with an instance store and room for the mounter's 4Gi memory request; c5d.large has 4 GiB in all.
+    instanceType: m5d.large
+    desiredCapacity: 1
+    amiFamily: AmazonLinux2023
+    labels:
+      s3.csi.aws.com/local-nvme: "true"
+    iam:
+      attachPolicyARNs:
+        # These are required for node to function,
+        # see https://eksctl.io/usage/iam-policies/#attaching-policies-by-arn
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        # These are for end-to-end tests:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      attachPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3express:*"
+            Resource: "*"

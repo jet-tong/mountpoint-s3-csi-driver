@@ -1,0 +1,34 @@
+# Dev only: the mounter's cache on the NVMe instance store, on the NVMe node only. Order:
+#   eksctl create nodegroup -f dev/mp-dev-nvme-nodegroup.yaml      # one m5d.large, labelled s3.csi.aws.com/local-nvme=true
+#   kubectl apply -f dev/mp-dev-nvme-local-provisioner.yaml        # offers its disk in StorageClass nvme-ssd
+#   helm upgrade --install aws-mountpoint-s3-csi-driver ./charts/aws-mountpoint-s3-csi-driver --namespace kube-system \
+#     --values ./charts/aws-mountpoint-s3-csi-driver/values.yaml --values dev/mp-dev-nvme-values.yaml \
+#     --set unsupportedDevInstall=true --set image.repository=<ecr repo url> --set image.pullPolicy=Always --set image.tag=latest \
+#     --set experimental.mounterMode=daemonset --set experimental.dynamicVolumeProvisioningFromExistingBucket=true
+#   kubectl -n kube-system delete po -l app=s3-csi-daemonset-mounter   # the mounter DaemonSet is OnDelete
+#   kubectl apply -f examples/kubernetes/static_provisioning/jetong_cache_nvme.yaml
+# Undo: delete the examples, run ./dev/mp-dev.sh deploy-helm-chart (back to the default cache), delete the provisioner,
+# then: eksctl delete nodegroup -f dev/mp-dev-nvme-nodegroup.yaml --approve   (the node costs money while it exists)
+#
+# The chart has one mounter config for every node, so this pins the driver (s3-csi-node and the mounter) to the NVMe node:
+# S3 volumes on other nodes do not mount while this is deployed. s3-csi-node exits on a node without a mounter, hence both.
+# A list in a values file replaces the whole list, so every field is set here.
+node:
+  nodeSelector:
+    s3.csi.aws.com/local-nvme: "true"
+daemonsetMounters:
+  - maxVolumesPerNode: 5 # jetong_cache_nvme_deployment_5.yaml puts 5 volumes on the one NVMe node
+    memoryLimitStrategy: equalSplit
+    resources:
+      requests:
+        memory: "4Gi"
+        cpu: "500m"
+    cache:
+      ephemeral:
+        storageClassName: nvme-ssd
+        resourceRequests: 10Gi # the local PV is the whole disk; equalSplit divides this request
+      cacheLimitStrategy: equalSplit
+    logLevel: 4
+    podLabels: {}
+    affinity: {}
+    imagePullSecrets: []

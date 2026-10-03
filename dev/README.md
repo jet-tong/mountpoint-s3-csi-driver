@@ -556,6 +556,31 @@ required environment variables:
   MOUNTPOINT_CSI_DEV_REGION          AWS region for the dev stack (e.g., eu-north-1)
 ```
 
+### Local cache on an NVMe instance store
+
+Dev only. While deployed, the driver runs only on the NVMe node, so S3 volumes on other nodes do not mount. The node costs money while it exists.
+
+```bash
+# Set up
+eksctl create nodegroup -f dev/mp-dev-nvme-nodegroup.yaml
+kubectl apply -f dev/mp-dev-nvme-local-provisioner.yaml
+helm upgrade --install aws-mountpoint-s3-csi-driver ./charts/aws-mountpoint-s3-csi-driver --namespace kube-system \
+    --values ./charts/aws-mountpoint-s3-csi-driver/values.yaml --values dev/mp-dev-nvme-values.yaml \
+    --set unsupportedDevInstall=true --set image.pullPolicy=Always --set image.tag=latest \
+    --set image.repository="$(aws ecr describe-repositories --region eu-north-1 --repository-names mp-dev --query 'repositories[0].repositoryUri' --output text)" \
+    --set experimental.mounterMode=daemonset --set experimental.dynamicVolumeProvisioningFromExistingBucket=true
+kubectl -n kube-system delete po -l app=s3-csi-daemonset-mounter
+
+# Try it
+kubectl apply -f examples/kubernetes/static_provisioning/jetong_cache_nvme_deployment_5.yaml
+
+# Tear down
+kubectl delete -f examples/kubernetes/static_provisioning/jetong_cache_nvme_deployment_5.yaml
+./dev/mp-dev.sh deploy-helm-chart
+kubectl delete -f dev/mp-dev-nvme-local-provisioner.yaml
+eksctl delete nodegroup -f dev/mp-dev-nvme-nodegroup.yaml --approve
+```
+
 ### Running tests
 
 Ideally you would want to run tests before and after making any change. The CSI Driver has three different test suites:
