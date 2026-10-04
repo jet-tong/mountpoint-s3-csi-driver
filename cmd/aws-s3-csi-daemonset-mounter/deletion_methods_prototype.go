@@ -24,7 +24,7 @@ func removeWithDACOverride(dir string) error {
 }
 
 // removeWithChownWalk removes dir, a cache directory another UID owns, by giving each directory under it to uid:gid before reading it.
-// The mounter passes root, 0:0. Needs CAP_CHOWN only. Risk: root owns the mount's tree while removing it, in the mounter's own process, and is safe only because every step goes through a no-follow handle.
+// The mounter passes root, 0:0. Needs CAP_CHOWN only. Risk: root owns the mount's tree while removing it, in the mounter's own process (memory and one open descriptor per directory level, capped at maxCacheTreeDepth), and is safe only because every step goes through a no-follow handle.
 func removeWithChownWalk(dir string, uid, gid int) error {
 	parent, err := unix.Open(filepath.Dir(dir), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -81,6 +81,7 @@ func takeDir(parentFd int, name string, uid, gid int) (int, error) {
 		return -1, err
 	}
 	// fchmod refuses an O_PATH handle and fchmodat2 needs Linux 6.6, so chmod through the handle's /proc link, as glibc does.
+	// Note: chmod by name under parentFd would be as safe, since the parent is already root's 0700 so no other UID can swap the entry, and would not need /proc.
 	if err := os.Chmod("/proc/self/fd/"+strconv.Itoa(fd), mountCacheDirPerm); err != nil {
 		unix.Close(fd)
 		return -1, err
