@@ -29,7 +29,7 @@ import (
 //   - upgrade_and_rollback.go: initHelmClient, helmChartSource, helmChartName, helmReleaseNamespace
 //   - util.go: createVolumeResourceWithMountOptions, bucketNameFromVolumeResource, createPod, createPodWithoutWaiting,
 //     checkWriteToPathSucceed, checkReadFromPathSucceed, isDaemonsetMounterMode, awsConfig,
-//     execInMounterPod
+//     execInMounterPod, podOnNode
 
 const (
 	mounterDaemonSetName = "s3-csi-daemonset-mounter"
