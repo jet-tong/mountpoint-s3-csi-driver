@@ -248,6 +248,8 @@ func TestProcessManager_Launch_TracksNothingWhenStartFails(t *testing.T) {
 	err := pm.Launch("mount-doomed", "/usr/bin/mount-s3", mountoptions.Options{
 		Fd:         int(dev.Fd()),
 		BucketName: "bucket",
+		Uid:        mounter.UIDRangeStart,
+		Gid:        mounter.UIDRangeStart,
 	})
 	if err == nil {
 		t.Fatal("expected Launch to fail when the process cannot start")
