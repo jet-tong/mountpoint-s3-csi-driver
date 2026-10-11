@@ -108,7 +108,7 @@ func newCacheLimit(strategy cacheLimitStrategy, capacityBytes int64, maxVolumesP
 // maxCacheSizeFor returns the `--max-cache-size` to pass to a mount's Mountpoint, reading what the PV's
 // mountOptions asked for out of args. Unlike a memory target, 0 is a real size ("no cache"), so ok is
 // false when args should pass through as they are.
-func (l cacheLimit) maxCacheSizeFor(volumeId string, args mountpoint.Args) (sizeMiB int64, ok bool) {
+func (l cacheLimit) maxCacheSizeFor(volumeId string, args mountpoint.Args, v2CacheSizeBytes int64) (sizeMiB int64, ok bool) {
 	// Mountpoint refuses --max-cache-size without --cache, which only a mount that opted in has.
 	// Leave stray --max-cache-size for Mountpoint to reject.
 	if !args.Has(mountpoint.ArgCache) {
@@ -118,6 +118,10 @@ func (l cacheLimit) maxCacheSizeFor(volumeId string, args mountpoint.Args) (size
 
 	if l.strategy == cacheLimitNone {
 		if !hasDeclared {
+			if v2CacheSizeBytes > 0 {
+				// Match v2, in float as v2 did: bytes * 95 overflows int64 above 86 PiB.
+				return int64(float64(v2CacheSizeBytes) * cacheMarginPercent / 100 / bytesPerMiB), true
+			}
 			klog.Warningf("Volume %s does not set %s in its PV mountOptions and cache.limitStrategy=%s, "+
 				"so nothing bounds its share of the cache volume. Together the mounts on this node can fill it. "+
 				"Set %s in the PV mountOptions, or set daemonsetMounters[].cache.limitStrategy=%s to "+

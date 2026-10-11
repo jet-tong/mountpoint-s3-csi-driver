@@ -396,10 +396,11 @@ func TestProcessManager_Launch_MaxCacheSize(t *testing.T) {
 	const cacheArg = "--cache"
 
 	testCases := []struct {
-		name     string
-		cache    cacheLimit
-		args     []string
-		wantArgs []string
+		name             string
+		cache            cacheLimit
+		args             []string
+		v2CacheSizeBytes int64
+		wantArgs         []string
 	}{
 		{
 			name:     "equalSplit injects this node's share",
@@ -419,6 +420,14 @@ func TestProcessManager_Launch_MaxCacheSize(t *testing.T) {
 			args:     []string{cacheArg, "--max-cache-size=3000"},
 			wantArgs: []string{"--foreground", "--max-cache-size=3000"},
 		},
+		{
+			// 100 PiB: multiplying its bytes by 95 in int64, as the equalSplit share does, wraps to a negative size.
+			name:             "none caps a PV that sets no size at 95% of its v2 cache size, even one too large to multiply in int64",
+			cache:            cacheLimit{strategy: cacheLimitNone},
+			args:             []string{cacheArg},
+			v2CacheSizeBytes: 100 * 1024 * 1024 * gib,
+			wantArgs:         []string{"--foreground", "--max-cache-size=102005473280"},
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -428,11 +437,12 @@ func TestProcessManager_Launch_MaxCacheSize(t *testing.T) {
 			dev := mountertest.OpenDevNull(t)
 
 			options := mountoptions.Options{
-				Fd:         int(dev.Fd()),
-				BucketName: "my-bucket",
-				Args:       testCase.args,
-				Uid:        mountoptions.UIDRangeStart,
-				Gid:        mountoptions.UIDRangeStart,
+				Fd:               int(dev.Fd()),
+				BucketName:       "my-bucket",
+				Args:             testCase.args,
+				Uid:              mountoptions.UIDRangeStart,
+				Gid:              mountoptions.UIDRangeStart,
+				V2CacheSizeBytes: testCase.v2CacheSizeBytes,
 			}
 			assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", options))
 
