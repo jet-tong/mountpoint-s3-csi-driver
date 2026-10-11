@@ -268,11 +268,15 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return fmt.Errorf("connection to s3-csi-daemonset-mounter not yet established, allowing kubelet to retry NodePublishVolume: %w. %s", ErrCommDirNotReady, helpMessageForCheckingMounterPodStatus())
 	}
 
+	// The kubelet republishes a mounted target periodically, so a PV's deprecated settings are warned about on a new target only.
+	newTarget := targetState == TargetAbsent
+
 	// Decide whether this mount caches, rejecting a cache request this node cannot serve.
-	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.hasCacheVolume)
+	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.hasCacheVolume, newTarget)
 	if err != nil {
 		return err
 	}
+	v2CacheSizeBytes := v2CacheSizeFor(volumeCtx, volumeID, caches, newTarget)
 	// Discard any PV supplied path (repeated cache mount options scenario - must remove all args)
 	for args.Has(mountpoint.ArgCache) {
 		args.Remove(mountpoint.ArgCache)
@@ -285,13 +289,13 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	// All paths (republish, share, new mount) go through mountOrShareSource
 	// which holds the per-volume lock and validates compatibility before any
 	// credential writes.
-	return dm.mountOrShareSource(ctx, bucketName, target, volumeID, mounter.commDir, credentialCtx, args, fsGroup, userEnv, targetState == TargetHealthy)
+	return dm.mountOrShareSource(ctx, bucketName, target, volumeID, mounter.commDir, credentialCtx, args, v2CacheSizeBytes, fsGroup, userEnv, targetState == TargetHealthy)
 }
 
 // mountOrShareSource implements the pod-sharing Mount flow using MountMap.
 func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName string, target string,
 	volumeID string, commDir string, credentialCtx credentialprovider.ProvideContext,
-	args mountpoint.Args, fsGroup string, userEnv envprovider.Environment, targetIsMounted bool) error {
+	args mountpoint.Args, v2CacheSizeBytes int64, fsGroup string, userEnv envprovider.Environment, targetIsMounted bool) error {
 
 	entry := dm.lockCanonicalEntry(volumeID)
 	defer entry.mu.Unlock()
@@ -357,7 +361,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 
 	// New mount: FUSE mount at source, then bind to target.
 
-	if err := dm.fuseMount(ctx, bucketName, entry.SourcePath, volumeID, commDir, entry.Uid, args, userEnv, credsEnv, authSource); err != nil {
+	if err := dm.fuseMount(ctx, bucketName, entry.SourcePath, volumeID, commDir, entry.Uid, args, v2CacheSizeBytes, userEnv, credsEnv, authSource); err != nil {
 		if tearErr := dm.teardownEntry(volumeID, entry, credentialCtx.ToCleanupCtx()); tearErr != nil {
 			klog.Errorf("DaemonsetMounter: cleanup after fuseMount failed for volume %s: %v (will retry)", volumeID, tearErr)
 		}
@@ -473,7 +477,7 @@ func (dm *DaemonsetMounter) prepareFreshMount(entry *MountEntry, volumeID, commD
 // Credentials are already provisioned by the caller (Mount).
 // commDir comes from the caller's single mounterPod load per NodePublishVolume.
 func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mountPath string,
-	volumeID string, commDir string, uid uint32, args mountpoint.Args, userEnv envprovider.Environment, credsEnv envprovider.Environment, authSource credentialprovider.AuthenticationSource) error {
+	volumeID string, commDir string, uid uint32, args mountpoint.Args, v2CacheSizeBytes int64, userEnv envprovider.Environment, credsEnv envprovider.Environment, authSource credentialprovider.AuthenticationSource) error {
 
 	if err := os.MkdirAll(mountPath, targetDirPerm); err != nil {
 		return fmt.Errorf("failed to create mount directory %q: %w", mountPath, err)
@@ -525,13 +529,14 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	defer sendCancel()
 
 	err = mountoptions.Send(sendCtx, sockPath, mountoptions.Options{
-		Fd:         fd,
-		BucketName: bucketName,
-		Args:       args.SortedList(),
-		Env:        env.List(),
-		VolumeId:   volumeID,
-		Uid:        uid,
-		Gid:        uid,
+		Fd:               fd,
+		BucketName:       bucketName,
+		Args:             args.SortedList(),
+		Env:              env.List(),
+		VolumeId:         volumeID,
+		Uid:              uid,
+		Gid:              uid,
+		V2CacheSizeBytes: v2CacheSizeBytes,
 	})
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || os.IsPermission(err) || errors.Is(err, context.DeadlineExceeded) {

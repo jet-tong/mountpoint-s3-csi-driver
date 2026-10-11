@@ -169,11 +169,12 @@ func TestCacheLimitMaxCacheSizeFor(t *testing.T) {
 	const cacheArg = "--cache=/cache/vol-test"
 
 	testCases := []struct {
-		name   string
-		limit  cacheLimit
-		args   []string
-		want   int64
-		wantOK bool
+		name             string
+		limit            cacheLimit
+		args             []string
+		v2CacheSizeBytes int64
+		want             int64
+		wantOK           bool
 	}{
 		{
 			name:   "equalSplit sizes a volume that declares nothing",
@@ -234,15 +235,32 @@ func TestCacheLimitMaxCacheSizeFor(t *testing.T) {
 			args:  []string{cacheArg, "--max-cache-size=1Gi"},
 			want:  0,
 		},
+		// A v2 PV's cache size
+		{
+			name:             "none prefers the PV's own size to its v2 cache size",
+			limit:            mustCacheLimit(t, cacheLimitNone, 4*gib, 4),
+			args:             []string{cacheArg, "--max-cache-size=3000"},
+			v2CacheSizeBytes: 2 * gib,
+			want:             0,
+		},
+		{
+			name:             "equalSplit ignores a v2 cache size",
+			limit:            mustCacheLimit(t, cacheLimitEqualSplit, 4*gib, 4),
+			args:             []string{cacheArg},
+			v2CacheSizeBytes: 2 * gib,
+			want:             972,
+			wantOK:           true,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := tc.limit.maxCacheSizeFor("vol-test", mountpoint.ParseArgs(tc.args))
+			got, ok := tc.limit.maxCacheSizeFor("vol-test", mountpoint.ParseArgs(tc.args), tc.v2CacheSizeBytes)
 			assert.Equals(t, tc.want, got)
 			assert.Equals(t, tc.wantOK, ok)
 		})
 	}
+	// Note: none's cap at 95% of a v2 cache size tested via process_manager_test.go "none caps a PV that sets no size at 95% of its v2 cache size, even one too large to multiply in int64".
 }
 
 // captureKlog redirects klog's output into the returned buffer for the rest of t. SetOutput alone
@@ -265,10 +283,11 @@ func TestCacheLimitWarnings(t *testing.T) {
 	const cacheArg = "--cache=/cache/vol-test"
 
 	testCases := []struct {
-		name     string
-		newLimit func(t *testing.T) cacheLimit
-		args     []string
-		wantWarn string // empty means no warning may fire
+		name             string
+		newLimit         func(t *testing.T) cacheLimit
+		args             []string
+		v2CacheSizeBytes int64
+		wantWarn         string // empty means no warning may fire
 	}{
 		{
 			name:     "equalSplit names the PV's size it ignores",
@@ -293,6 +312,12 @@ func TestCacheLimitWarnings(t *testing.T) {
 			args:     []string{cacheArg, "--max-cache-size=1024"},
 		},
 		{
+			name:             "none does not warn when a v2 cache size bounds the PV",
+			newLimit:         func(t *testing.T) cacheLimit { return mustCacheLimit(t, cacheLimitNone, 4*gib, 4) },
+			args:             []string{cacheArg},
+			v2CacheSizeBytes: 2 * gib,
+		},
+		{
 			name:     "a volume that does not cache is never warned about",
 			newLimit: func(t *testing.T) cacheLimit { return mustCacheLimit(t, cacheLimitNone, 4*gib, 4) },
 		},
@@ -307,7 +332,7 @@ func TestCacheLimitWarnings(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureKlog(t)
-			tc.newLimit(t).maxCacheSizeFor("vol-test", mountpoint.ParseArgs(tc.args))
+			tc.newLimit(t).maxCacheSizeFor("vol-test", mountpoint.ParseArgs(tc.args), tc.v2CacheSizeBytes)
 			if tc.wantWarn == "" {
 				// klog prefixes each line with its severity; newCacheLimit's own info line is expected.
 				for _, line := range strings.Split(logs.String(), "\n") {

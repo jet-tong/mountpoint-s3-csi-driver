@@ -157,7 +157,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	if targetMiB := pm.memory.targetFor(mountId, args); targetMiB > 0 {
 		args.Set(mountpoint.ArgMemoryTarget, strconv.FormatInt(targetMiB, 10))
 	}
-	if sizeMiB, ok := pm.cache.maxCacheSizeFor(mountId, args); ok {
+	if sizeMiB, ok := pm.cache.maxCacheSizeFor(mountId, args, options.V2CacheSizeBytes); ok {
 		args.Set(mountpoint.ArgMaxCacheSize, strconv.FormatInt(sizeMiB, 10))
 	}
 

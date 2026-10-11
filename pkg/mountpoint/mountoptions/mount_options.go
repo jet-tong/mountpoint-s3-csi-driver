@@ -46,6 +46,9 @@ type Options struct {
 	// spawns, so the kernel isolates it from every other Mountpoint on the node.
 	Uid uint32 `json:"uid"`
 	Gid uint32 `json:"gid"`
+	// V2CacheSizeBytes is the cache size the PV's v2 volume attributes set, which the daemonset mounter
+	// falls back to under cache.limitStrategy=none; 0 when the PV sets no usable one.
+	V2CacheSizeBytes int64 `json:"v2CacheSizeBytes,omitempty"`
 }
 
 // Send sends given mount `options` to given `sockPath` to be received by `Recv` / `RecvOnConn` function on the other end.

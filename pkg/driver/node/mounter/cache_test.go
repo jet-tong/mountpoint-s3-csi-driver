@@ -203,7 +203,7 @@ func TestValidateCacheRequest(t *testing.T) {
 				t.Run(testCase.name, func(t *testing.T) {
 					args := mountpoint.ParseArgs(testCase.mountOptions)
 
-					caches, err := validateCacheRequest(args, testCase.volumeCtx, volumeID, testCase.mounterHasCache)
+					caches, err := validateCacheRequest(args, testCase.volumeCtx, volumeID, testCase.mounterHasCache, true)
 
 					if testCase.expectedErrContains != "" {
 						if err == nil {
@@ -220,3 +220,5 @@ func TestValidateCacheRequest(t *testing.T) {
 		})
 	}
 }
+
+// Note: v2CacheSizeFor, and both warnings only on a new target, tested via daemonset_mounter_test.go "A v2 PV is warned about on a new target, naming what v3 does with its attributes" and "Warns once per new target, not on republishes".
