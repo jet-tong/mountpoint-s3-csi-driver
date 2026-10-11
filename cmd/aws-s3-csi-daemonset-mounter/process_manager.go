@@ -33,6 +33,13 @@ const cacheVolumePerm = fs.FileMode(0711)
 // the mounter overrides it with CAP_DAC_OVERRIDE.
 const mountCacheDirPerm = fs.FileMode(0700)
 
+const (
+	defaultReleaseRetryDelay = time.Second
+	maxReleaseRetryDelay     = time.Minute
+	// Leaves exit cleanup and its error inside the default 30 s termination grace period.
+	defaultShutdownTimeout = 20 * time.Second
+)
+
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
 	commDir         string
@@ -41,13 +48,21 @@ type ProcessManager struct {
 	memory          memoryLimit
 	cache           cacheLimit
 	chownForTesting func(path string, uid, gid int) error // unprivileged tests record ownership instead of chown
+	// Tests hold or fail a removal through this; nil removes for real.
+	removeAllForTesting func(path string) error
+
+	// Fields rather than constants, so tests can shorten them.
+	releaseRetryDelay time.Duration
+	shutdownTimeout   time.Duration
 
 	mu        sync.Mutex
 	processes map[uint32]mountpointProcess // the UID a Mountpoint runs as -> that Mountpoint; one per UID
-	wg        sync.WaitGroup               // tracks waiter goroutines
+	wg        sync.WaitGroup               // tracks waiter and release goroutines
+	stopping  chan struct{}                // closed by Shutdown, so a failing release stops retrying
 }
 
-// mountpointProcess is a running Mountpoint and the mount it serves.
+// mountpointProcess is a running Mountpoint and the mount it serves. Its zero value marks a UID as Releasing: its
+// Mountpoint has exited, its mount ID is free, and the UID stays taken until what it left behind is removed.
 type mountpointProcess struct {
 	mountId string
 	handle  ProcessHandle
@@ -55,12 +70,15 @@ type mountpointProcess struct {
 
 func NewProcessManager(commDir, cacheDir string, runner ProcessRunner, memory memoryLimit, cache cacheLimit) *ProcessManager {
 	return &ProcessManager{
-		commDir:   commDir,
-		cacheDir:  cacheDir,
-		runner:    runner,
-		memory:    memory,
-		cache:     cache,
-		processes: make(map[uint32]mountpointProcess),
+		commDir:           commDir,
+		cacheDir:          cacheDir,
+		runner:            runner,
+		memory:            memory,
+		cache:             cache,
+		releaseRetryDelay: defaultReleaseRetryDelay,
+		shutdownTimeout:   defaultShutdownTimeout,
+		processes:         make(map[uint32]mountpointProcess),
+		stopping:          make(chan struct{}),
 	}
 }
 
@@ -79,7 +97,8 @@ func (pm *ProcessManager) secureCacheVolume() error {
 	return nil
 }
 
-// emptyCacheVolume empties the /cache volume, and returns an error for anything it could not remove.
+// emptyCacheVolume empties the /cache volume, skipping entries still in use, and returns an error for anything it
+// did not remove.
 func (pm *ProcessManager) emptyCacheVolume() error {
 	if pm.cacheDir == "" {
 		return nil
@@ -88,10 +107,21 @@ func (pm *ProcessManager) emptyCacheVolume() error {
 	if err != nil {
 		return fmt.Errorf("failed to list cache volume %q: %w", pm.cacheDir, err)
 	}
+	pm.mu.Lock()
+	held := make(map[string]bool, len(pm.processes))
+	for uid := range pm.processes {
+		held[mountCacheDirName(uid)] = true
+	}
+	pm.mu.Unlock()
 	var errs []error
 	leftovers := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		leftovers[entry.Name()] = true
+		// A release Shutdown stopped waiting for, or a Mountpoint still running, may still use it; a second remover would race.
+		if held[entry.Name()] {
+			errs = append(errs, fmt.Errorf("skipped cache volume entry %q: a Mountpoint or its removal still holds it, see the mounter log", entry.Name()))
+			continue
+		}
 		if err := pm.removeCacheVolumeEntry(entry.Name()); err != nil {
 			errs = append(errs, err)
 		}
@@ -187,7 +217,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	// Hold lock across duplicate check and process start to prevent races.
 	pm.mu.Lock()
 
-	// Reject a used mount ID. processes holds at most maxVolumesPerNode entries, so an O(n) scan is acceptable.
+	// Reject a used mount ID. processes holds at most maxVolumesPerNode running entries, plus those still being released, so an O(n) scan is acceptable.
 	for _, p := range pm.processes {
 		if p.mountId == mountId {
 			pm.mu.Unlock()
@@ -201,6 +231,10 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	if other, taken := pm.processes[options.Uid]; taken {
 		pm.mu.Unlock()
 		fuseDev.Close()
+		if other.handle == nil {
+			klog.Errorf("Refusing to launch mount %s with UID %d: what its previous mount left is still being removed", mountId, options.Uid)
+			return fmt.Errorf("refusing to launch mount %s: what UID %d's previous mount left is still being removed", mountId, options.Uid)
+		}
 		// Don't expose PV name / mountID for other mounts in error which reaches pod events, and only log it
 		klog.Errorf("Refusing to launch mount %s with UID %d already in use by mount %s", mountId, options.Uid, other.mountId)
 		return fmt.Errorf("refusing to launch mount %s: UID %d is already in use by another mount", mountId, options.Uid)
@@ -211,7 +245,17 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	// Now that we're certain no running Mountpoint has this UID, the remaining cache directory for this UID is a leftover: remove it.
 	if pm.cacheDir != "" {
-		if err := pm.removeCacheVolumeEntry(mountCacheDir); err != nil {
+		err := os.Remove(filepath.Join(pm.cacheDir, mountCacheDir))
+		if errors.Is(err, syscall.ENOTEMPTY) {
+			// Emptying it can take minutes, so it is released in the background and this launch refused as for a busy UID.
+			pm.markReleasing(options.Uid)
+			pm.startRelease(options.Uid)
+			pm.mu.Unlock()
+			fuseDev.Close()
+			klog.Errorf("Refusing to launch mount %s with UID %d: removing what an earlier mount left in %s", mountId, options.Uid, mountCacheDir)
+			return fmt.Errorf("refusing to launch mount %s: what UID %d's previous mount left is still being removed", mountId, options.Uid)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			pm.mu.Unlock()
 			fuseDev.Close()
 			klog.Errorf("Failed to remove leftover cache directory %s: %v", mountCacheDir, err)
@@ -251,19 +295,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		defer pm.wg.Done()
 		exitCode, stderr := handle.Wait()
 
-		// Before freeing mountId and the UID, so a relaunch cannot create the directory this then removes.
-		if cached {
-			if err := pm.removeCacheVolumeEntry(mountCacheDir); err != nil {
-				klog.Errorf("Failed to remove cache directory of mount %s: %v", mountId, err)
-			}
-		}
-
 		pm.mu.Lock()
 		// Before freeing mountId, so a relaunch's removal of a stale error file always comes after this write.
 		if exitCode != 0 {
 			pm.writeErrorFile(mountId, stderr)
 		}
-		delete(pm.processes, options.Uid)
+		// Frees mountId for a remount; the UID stays taken until release ends, so a relaunch as it cannot race the removal.
+		pm.markReleasing(options.Uid)
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
@@ -271,6 +309,8 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		} else {
 			klog.Infof("Mountpoint for mount %s (UID %d) exited cleanly", mountId, options.Uid)
 		}
+
+		pm.release(options.Uid)
 	}()
 
 	return nil
@@ -279,6 +319,46 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 // mountCacheDirName names the cache directory of the Mountpoint running as uid.
 func mountCacheDirName(uid uint32) string {
 	return fmt.Sprintf("uid-%d", uid)
+}
+
+// markReleasing keeps uid taken, and its directory out of exit cleanup, until release ends. Callers hold pm.mu.
+func (pm *ProcessManager) markReleasing(uid uint32) {
+	pm.processes[uid] = mountpointProcess{}
+}
+
+// startRelease runs release in the background, counted so that Shutdown waits for it.
+func (pm *ProcessManager) startRelease(uid uint32) {
+	pm.wg.Add(1)
+	go func() {
+		defer pm.wg.Done()
+		pm.release(uid)
+	}()
+}
+
+// release removes uid's cache directory, retrying with backoff until it succeeds or Shutdown starts, then frees uid.
+func (pm *ProcessManager) release(uid uint32) {
+	// Freed after a stop too, so exit cleanup tries once more and its error says why.
+	defer func() {
+		pm.mu.Lock()
+		delete(pm.processes, uid)
+		pm.mu.Unlock()
+	}()
+	mountCacheDir := mountCacheDirName(uid)
+	for delay := pm.releaseRetryDelay; ; delay = min(2*delay, maxReleaseRetryDelay) {
+		var err error
+		if pm.cacheDir != "" {
+			err = pm.removeCacheVolumeEntry(mountCacheDir)
+		}
+		if err == nil {
+			return
+		}
+		klog.Errorf("Failed to remove cache volume entry %s, retrying in %v: %v", mountCacheDir, delay, err)
+		select {
+		case <-pm.stopping:
+			return
+		case <-time.After(delay):
+		}
+	}
 }
 
 // removeCacheVolumeEntry removes an entry of the cache volume, whoever owns it.
@@ -292,10 +372,17 @@ func (pm *ProcessManager) removeCacheVolumeEntry(entryName string) error {
 	path := filepath.Join(pm.cacheDir, entryName)
 	// Emptying another UID's tree needs CAP_DAC_OVERRIDE, and CAP_FOWNER for a sticky subdirectory; the chart grants both with a cache.
 	// RemoveAll opens each directory with O_NOFOLLOW, so a planted symlink is removed, not followed.
-	if err := os.RemoveAll(path); err != nil {
+	if err := pm.removeAllWithDefault(path); err != nil {
 		return fmt.Errorf("failed to remove cache directory %q: %w", path, err)
 	}
 	return nil
+}
+
+func (pm *ProcessManager) removeAllWithDefault(path string) error {
+	if pm.removeAllForTesting != nil {
+		return pm.removeAllForTesting(path)
+	}
+	return os.RemoveAll(path)
 }
 
 // createMountCacheDir creates a mount's cache directory, owned by the UID its Mountpoint runs as. Mountpoint writes ./mountpoint-cache inside it.
@@ -335,16 +422,30 @@ func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
 	}
 }
 
-// Shutdown sends SIGTERM to all processes and waits for them to exit.
+// Shutdown sends SIGTERM to all Mountpoints, and waits at most shutdownTimeout for them to exit and every release to end.
 func (pm *ProcessManager) Shutdown() {
+	close(pm.stopping)
 	pm.mu.Lock()
 	for _, p := range pm.processes {
+		// A Releasing UID's Mountpoint has already exited.
+		if p.handle == nil {
+			continue
+		}
 		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", p.mountId, p.handle.Pid())
 		p.handle.Signal(syscall.SIGTERM)
 	}
 	pm.mu.Unlock()
 
-	pm.wg.Wait()
+	waited := make(chan struct{})
+	go func() {
+		pm.wg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(pm.shutdownTimeout):
+		klog.Errorf("Stopped waiting after %v for Mountpoints to exit and leftovers to be removed", pm.shutdownTimeout)
+	}
 }
 
 // prefixWriter wraps an io.Writer and prefixes each line with a mount ID.
@@ -382,18 +483,23 @@ func (pm *ProcessManager) LogStatusPeriodically(interval time.Duration) {
 		time.Sleep(interval)
 
 		pm.mu.Lock()
-		tracked := len(pm.processes)
+		releasing := 0
 		var mounts []string
 		for uid, p := range pm.processes {
+			if p.handle == nil {
+				releasing++
+				continue
+			}
 			mounts = append(mounts, fmt.Sprintf("%s:%d", p.mountId, uid))
 		}
+		tracked := len(mounts)
 		pm.mu.Unlock()
 
 		actual := countChildProcesses()
 		openFDs := countOpenFDs()
 		goroutines := runtime.NumGoroutine()
-		klog.Infof("Status: tracked=%d actual_children=%d open_fds=%d goroutines=%d memory_limit_strategy=%s share_mib=%d cache_limit_strategy=%s cache_share_mib=%d mounts=%v",
-			tracked, actual, openFDs, goroutines, pm.memory.strategy, pm.memory.shareMiB,
+		klog.Infof("Status: tracked=%d releasing=%d actual_children=%d open_fds=%d goroutines=%d memory_limit_strategy=%s share_mib=%d cache_limit_strategy=%s cache_share_mib=%d mounts=%v",
+			tracked, releasing, actual, openFDs, goroutines, pm.memory.strategy, pm.memory.shareMiB,
 			pm.cache.strategy, pm.cache.shareMiB, mounts)
 	}
 }
