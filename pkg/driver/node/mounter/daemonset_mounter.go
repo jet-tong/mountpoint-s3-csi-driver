@@ -307,7 +307,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 		VolumeHandle:             credentialCtx.VolumeID,
 	}
 
-	if err := dm.resolveExistingSource(ctx, entry, volumeID, &incomingParams); err != nil {
+	if err := dm.resolveExistingSource(ctx, entry, volumeID, &incomingParams, targetIsMounted); err != nil {
 		return err
 	}
 
@@ -397,7 +397,7 @@ func (dm *DaemonsetMounter) lockCanonicalEntry(volumeID string) *MountEntry {
 
 // resolveExistingSource decides what to do with an entry that believes its source is mounted: share
 // it, or clear sourceMounted so the caller re-establishes it. Caller must hold entry.mu.
-func (dm *DaemonsetMounter) resolveExistingSource(ctx context.Context, entry *MountEntry, volumeID string, incoming *MountParams) error {
+func (dm *DaemonsetMounter) resolveExistingSource(ctx context.Context, entry *MountEntry, volumeID string, incoming *MountParams, targetIsMounted bool) error {
 	if !entry.sourceMounted {
 		return nil
 	}
@@ -413,8 +413,14 @@ func (dm *DaemonsetMounter) resolveExistingSource(ctx context.Context, entry *Mo
 		entry.sourceMounted = false
 		return nil
 	default:
+		// A PV's mountOptions can change while it is mounted and the kubelet republishes with the new ones,
+		// so a mounted target is checked on everything else; match v2.
+		checked := *incoming
+		if targetIsMounted {
+			checked.MountOptions = entry.Params.MountOptions
+		}
 		// Healthy source — enforce compatibility before any credential writes.
-		if err := entry.Params.ValidateCompatibility(incoming); err != nil {
+		if err := entry.Params.ValidateCompatibility(&checked); err != nil {
 			return fmt.Errorf("cannot share mount for volume %s: %w", volumeID, err)
 		}
 		return nil

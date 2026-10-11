@@ -1069,6 +1069,26 @@ func TestDaemonsetMounter_PodSharing(t *testing.T) {
 		assert.Contains(t, err.Error(), "serviceAccountName mismatch")
 	})
 
+	t.Run("Second pod rejected with different mount options without writing credentials", func(t *testing.T) {
+		testCtx := setupDM(t)
+
+		// Once, for the first pod: the second must be rejected before its credentials are written.
+		writesOnce := mock_credentialprovider.NewMockProviderInterface(gomock.NewController(t))
+		writesOnce.EXPECT().Provide(gomock.Any(), gomock.Any()).
+			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).Times(1)
+		writesOnce.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
+		testCtx.useCredProvider(writesOnce)
+
+		testCtx.mountAndServe("pod-a-uid", nil)
+
+		err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath("pod-b-uid"), testCtx.driverProvideCtx("pod-b-uid"),
+			nil, mountpoint.ParseArgs([]string{"--allow-delete"}), "", nil)
+		if err == nil {
+			t.Fatal("expected error for a second pod with different mount options")
+		}
+		assert.Contains(t, err.Error(), "mount options mismatch")
+	})
+
 	t.Run("Second pod with different service account allowed with driver auth", func(t *testing.T) {
 		testCtx := setupDM(t)
 		target1 := testCtx.targetPath("pod-a-uid")
@@ -1222,6 +1242,65 @@ func TestDaemonsetMounter_PodSharing(t *testing.T) {
 
 		// Only 1 FUSE mount should have happened (the initial one)
 		assert.Equals(t, 1, fuseMountCount)
+	})
+
+	t.Run("Republish with edited mount options refreshes credentials", func(t *testing.T) {
+		testCtx := setupDM(t)
+
+		// Once for the mount, once for the republish.
+		refreshes := mock_credentialprovider.NewMockProviderInterface(gomock.NewController(t))
+		refreshes.EXPECT().Provide(gomock.Any(), gomock.Any()).
+			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).Times(2)
+		refreshes.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
+		testCtx.useCredProvider(refreshes)
+
+		testCtx.mountAndServe("pod-a-uid", nil)
+
+		// A PV's mountOptions can be edited while it is mounted, and the kubelet republishes with the new ones.
+		err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath("pod-a-uid"), testCtx.driverProvideCtx("pod-a-uid"),
+			nil, mountpoint.ParseArgs([]string{"--allow-delete"}), "", nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Mounted target with different service account (pod auth) rejected without writing credentials", func(t *testing.T) {
+		testCtx := setupDM(t)
+
+		// Once, for the first pod.
+		writesOnce := mock_credentialprovider.NewMockProviderInterface(gomock.NewController(t))
+		writesOnce.EXPECT().Provide(gomock.Any(), gomock.Any()).
+			Return(envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil).Times(1)
+		writesOnce.EXPECT().Cleanup(gomock.Any()).Return(nil).AnyTimes()
+		testCtx.useCredProvider(writesOnce)
+
+		mountRes := make(chan error, 1)
+		go func() {
+			mountRes <- testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath("pod-a-uid"), credentialprovider.ProvideContext{
+				WorkloadPodID:        "pod-a-uid",
+				VolumeID:             testCtx.volumeID,
+				AuthenticationSource: "pod",
+				ServiceAccountName:   "sa-a",
+				PodNamespace:         "default",
+			}, nil, mountpoint.ParseArgs(nil), "", nil)
+		}()
+		testCtx.receiveMountOptions()
+		assert.NoError(t, <-mountRes)
+
+		// A live mount this volume's mount does not track, as a v1 or v2 mount is when legacy support is off.
+		other := testCtx.targetPath("pod-b-uid")
+		assert.NoError(t, os.MkdirAll(other, 0750))
+		assert.NoError(t, testCtx.mount.Mount("mountpoint-s3", other, "fuse", nil))
+
+		err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, other, credentialprovider.ProvideContext{
+			WorkloadPodID:        "pod-b-uid",
+			VolumeID:             testCtx.volumeID,
+			AuthenticationSource: "pod",
+			ServiceAccountName:   "sa-b",
+			PodNamespace:         "default",
+		}, nil, mountpoint.ParseArgs(nil), "", nil)
+		if err == nil {
+			t.Fatal("expected error for a mounted target with a different service account")
+		}
+		assert.Contains(t, err.Error(), "serviceAccountName mismatch")
 	})
 }
 
