@@ -603,6 +603,63 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		waitAndAssertUID(t, pm, 65537, mountpointProcess{})
 		pm.Shutdown()
 	})
+
+	t.Run("under equalSplit, refuses a cache while those held, running or still being deleted, fill the cache volume, and serves it once one is deleted", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		// Room for four caches of 972 MiB: 4 GiB * 95% / 4.
+		pm, cacheDir := newProcessManagerWithCache(t, fr, mustCacheLimit(t, cacheLimitEqualSplit, 4*gib, 4))
+		pm.deleteRetryDelayForTesting = 10 * time.Millisecond
+		for i := range 4 {
+			options := cachedOptions(t)
+			options.Uid, options.Gid = uint32(65536+i), uint32(65536+i)
+			assert.NoError(t, pm.Launch(fmt.Sprintf("pv-%d", i), "/usr/bin/mount-s3", options))
+		}
+		unlock := createUnremovableCacheEntry(t, cacheDir, dirName)
+		fr.handles[0].Exit(137, "")
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{deletingCache: true, cacheMiB: 972})
+
+		fifth := cachedOptions(t)
+		fifth.Uid, fifth.Gid = 65540, 65540
+		err := pm.Launch("pv-4", "/usr/bin/mount-s3", fifth)
+		if err == nil {
+			t.Fatal("expected a fifth cache to be refused while the first is still being deleted")
+		}
+		assert.Contains(t, err.Error(), "refusing to launch mount pv-4: its 972 MiB cache does not fit in the 0 MiB left on the cache volume")
+		// The error reaches pv-4's pod events, so it names no other mount.
+		assert.Equals(t, 1, strings.Count(err.Error(), "pv-"))
+		// The refusal comes before any side effect, so pv-4 has no directory yet.
+		assertNotExist(t, filepath.Join(cacheDir, "uid-65540"))
+		// An uncached mount holds no cache, so it is served on a full volume and pv-4 below still fits.
+		uncached := cachedOptions(t)
+		uncached.Args, uncached.Uid, uncached.Gid = nil, 65541, 65541
+		assert.NoError(t, pm.Launch("pv-uncached", "/usr/bin/mount-s3", uncached))
+
+		unlock()
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{})
+		fifth = cachedOptions(t)
+		fifth.Uid, fifth.Gid = 65540, 65540
+		assert.NoError(t, pm.Launch("pv-4", "/usr/bin/mount-s3", fifth))
+
+		for _, h := range fr.handles[1:] {
+			h.Exit(0, "")
+		}
+		pm.Shutdown()
+	})
+
+	t.Run("under none, never refuses a cache, whatever the PVs ask for", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, _ := newProcessManagerWithCache(t, fr, mustCacheLimit(t, cacheLimitNone, 4*gib, 4))
+		for i := range 5 {
+			options := cachedOptions(t, "--max-cache-size=3000")
+			options.Uid, options.Gid = uint32(65536+i), uint32(65536+i)
+			assert.NoError(t, pm.Launch(fmt.Sprintf("pv-%d", i), "/usr/bin/mount-s3", options))
+		}
+
+		for _, h := range fr.handles {
+			h.Exit(0, "")
+		}
+		pm.Shutdown()
+	})
 }
 
 // assertMountReleased asserts that a failed Launch gave up the lock and tracks nothing, so a retry can proceed.

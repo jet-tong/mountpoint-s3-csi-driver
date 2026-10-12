@@ -63,6 +63,8 @@ type mountpointProcess struct {
 	handle  ProcessHandle
 	// Keeps the UID taken, with no mount ID or handle, until the exited Mountpoint's cache directory is deleted.
 	deletingCache bool
+	// The --max-cache-size the mounter gave its Mountpoint (equalSplit only), held until its cache directory is deleted.
+	cacheMiB int64
 }
 
 func NewProcessManager(commDir, cacheDir string, runner ProcessRunner, memory memoryLimit, cache cacheLimit) *ProcessManager {
@@ -170,7 +172,8 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	if targetMiB := pm.memory.targetFor(mountId, args); targetMiB > 0 {
 		args.Set(mountpoint.ArgMemoryTarget, strconv.FormatInt(targetMiB, 10))
 	}
-	if sizeMiB, ok := pm.cache.maxCacheSizeFor(mountId, args); ok {
+	sizeMiB, sized := pm.cache.maxCacheSizeFor(mountId, args)
+	if sized {
 		args.Set(mountpoint.ArgMaxCacheSize, strconv.FormatInt(sizeMiB, 10))
 	}
 
@@ -221,6 +224,16 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		klog.Errorf("Refusing to launch mount %s with UID %d already in use by mount %s", mountId, options.Uid, other.mountId)
 		return fmt.Errorf("refusing to launch mount %s: UID %d is already in use by another mount", mountId, options.Uid)
 	}
+	// Refuse a cache that does not fit beside those held, running or still being deleted. Only equalSplit sizes a cache.
+	leftMiB := pm.cache.budgetMiB
+	for _, p := range pm.processes {
+		leftMiB -= p.cacheMiB
+	}
+	if sized && sizeMiB > leftMiB {
+		pm.mu.Unlock()
+		fuseDev.Close()
+		return fmt.Errorf("refusing to launch mount %s: its %d MiB cache does not fit in the %d MiB left on the cache volume", mountId, sizeMiB, leftMiB)
+	}
 	// Delete any error files that earlier Mountpoint of this PV wrote after node deletes error files.
 	// TODO if we add process to ensure Mountpoint exited, this should not be needed.
 	os.Remove(filepath.Join(pm.commDir, mountId+errorFileExt))
@@ -257,7 +270,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	// Child has its own copy of the FD (kernel dup'd it during fork/exec).
 	fuseDev.Close()
 
-	pm.processes[options.Uid] = mountpointProcess{mountId: mountId, handle: handle}
+	pm.processes[options.Uid] = mountpointProcess{mountId: mountId, handle: handle, cacheMiB: sizeMiB}
 	pm.mu.Unlock()
 
 	klog.Infof("Launched Mountpoint for mount %s as UID %d (pid %d)", mountId, options.Uid, handle.Pid())
@@ -274,7 +287,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		}
 		if cached {
 			// Frees mountId for a remount but keeps the UID, so a relaunch as it cannot create the directory this then deletes.
-			pm.processes[options.Uid] = mountpointProcess{deletingCache: true}
+			pm.processes[options.Uid] = mountpointProcess{deletingCache: true, cacheMiB: sizeMiB}
 		} else {
 			delete(pm.processes, options.Uid)
 		}
