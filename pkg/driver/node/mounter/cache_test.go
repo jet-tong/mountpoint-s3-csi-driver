@@ -6,31 +6,36 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/volumecontext"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
 )
 
-func TestMounterPodHasCacheVolume(t *testing.T) {
+func TestMounterPodCacheType(t *testing.T) {
 	emptyDir := corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
-	ephemeral := corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{}}
+	memory := corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}
+	ephemeral := corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+		Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: ptr.To("gp3")},
+	}}}
 
 	for _, testCase := range []struct {
 		name     string
 		volumes  []corev1.Volume
-		expected bool
+		expected CacheType
 	}{
-		{name: "A pod with only its comm volume has none", volumes: []corev1.Volume{{Name: "comm", VolumeSource: emptyDir}}},
-		{name: "An emptyDir named cache is one", volumes: []corev1.Volume{{Name: "comm", VolumeSource: emptyDir}, {Name: "cache", VolumeSource: emptyDir}}, expected: true},
-		{name: "An ephemeral volume named cache is one", volumes: []corev1.Volume{{Name: "cache", VolumeSource: ephemeral}}, expected: true},
+		{name: "A pod with only its comm volume has none", volumes: []corev1.Volume{{Name: "comm", VolumeSource: emptyDir}}, expected: CacheNone},
+		{name: "An emptyDir named cache is one", volumes: []corev1.Volume{{Name: "comm", VolumeSource: emptyDir}, {Name: "cache", VolumeSource: emptyDir}}, expected: "emptyDir"},
+		{name: "An emptyDir in memory is named with its medium", volumes: []corev1.Volume{{Name: "cache", VolumeSource: memory}}, expected: "emptyDir (medium Memory)"},
+		{name: "An ephemeral volume named cache is one, named with its StorageClass", volumes: []corev1.Volume{{Name: "cache", VolumeSource: ephemeral}}, expected: "ephemeral (StorageClass gp3)"},
 		// Match by exact name: the chart names it `cache`.
-		{name: "A volume whose name only contains cache is not one", volumes: []corev1.Volume{{Name: "cache-2", VolumeSource: emptyDir}}},
-		{name: "A pod with no volumes has none"},
+		{name: "A volume whose name only contains cache is not one", volumes: []corev1.Volume{{Name: "cache-2", VolumeSource: emptyDir}}, expected: CacheNone},
+		{name: "A pod with no volumes has none", expected: CacheNone},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			pod := corev1.Pod{Spec: corev1.PodSpec{Volumes: testCase.volumes}}
-			assert.Equals(t, testCase.expected, mounterPodHasCacheVolume(pod))
+			assert.Equals(t, testCase.expected, mounterPodCacheType(pod))
 		})
 	}
 }
@@ -203,7 +208,7 @@ func TestValidateCacheRequest(t *testing.T) {
 				t.Run(testCase.name, func(t *testing.T) {
 					args := mountpoint.ParseArgs(testCase.mountOptions)
 
-					caches, err := validateCacheRequest(args, testCase.volumeCtx, volumeID, testCase.mounterHasCache)
+					caches, err := validateCacheRequest(args, testCase.volumeCtx, volumeID, testCase.mounterHasCache, true)
 
 					if testCase.expectedErrContains != "" {
 						if err == nil {
@@ -220,3 +225,5 @@ func TestValidateCacheRequest(t *testing.T) {
 		})
 	}
 }
+
+// Note: cacheTypeFromPV for a PV, warnDeprecatedCacheSettings, maxCacheSizeFromDeprecatedPVSizes, and every warning only on a new target, tested via daemonset_mounter_test.go "A v2 PV mounts on this node's cache, with its deprecated settings warned about once" and "Warns once per new target, not on republishes".

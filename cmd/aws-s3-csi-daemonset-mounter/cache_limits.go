@@ -130,7 +130,7 @@ func (l cacheLimit) maxCacheSizeFor(volumeId string, args mountpoint.Args) (size
 
 	if hasDeclared {
 		klog.Warningf("Ignoring %s=%s for volume %s: cache.limitStrategy=%s gives every Mountpoint on this "+
-			"node an equal %d MiB share of this container's cache volume. Remove %s from the PV mountOptions.",
+			"node an equal %d MiB share of this container's cache volume. Remove %s from the PV mountOptions, and any v2 cache size.",
 			mountpoint.ArgMaxCacheSize, declared, volumeId, cacheLimitEqualSplit, l.shareMiB, mountpoint.ArgMaxCacheSize)
 	}
 
