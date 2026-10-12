@@ -1,9 +1,12 @@
 package mounter_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -24,7 +27,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
 	mountutils "k8s.io/mount-utils"
+	"k8s.io/utils/ptr"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/cluster"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -262,6 +267,23 @@ func (testCtx *dmTestCtx) driverProvideCtx(podUID string) credentialprovider.Pro
 func cacheArg(options mountoptions.Options) (value string, present bool) {
 	args := mountpoint.ParseArgs(options.Args)
 	return args.Value(mountpoint.ArgCache)
+}
+
+// captureKlog redirects klog's output into the returned buffer for the rest of t. SetOutput alone
+// captures nothing: logtostderr defaults true and klog short-circuits to os.Stderr before the sink.
+// The sink is process-global, so no test that uses this may call t.Parallel.
+func captureKlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	klog.LogToStderr(false)
+	// Every severity also writes to the INFO sink, so only that one captures; a nil sink would make klog create a log file.
+	klog.SetOutput(io.Discard)
+	klog.SetOutputBySeverity("INFO", &buf)
+	t.Cleanup(func() {
+		klog.SetOutput(nil)
+		klog.LogToStderr(true)
+	})
+	return &buf
 }
 
 // installOwnershipRecorders makes the mounter record chown/chmod instead of performing them, so
@@ -1280,6 +1302,162 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
 		assert.FileNotExists(t, mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
+	})
+
+	// v2 PVs
+	t.Run("A v2 PV mounts on this node's cache, with its deprecated settings warned about once", func(t *testing.T) {
+		disk := corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+		gp3 := corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: ptr.To("gp3")},
+		}}}
+
+		for _, testCase := range []struct {
+			name         string
+			nodeCache    corev1.VolumeSource
+			volumeCtx    map[string]string
+			mountOptions []string
+			// wantMaxCacheSize is the --max-cache-size the mounter receives, "" for none.
+			wantMaxCacheSize string
+			// wantWarnings holds a part of each warning s3-csi-node logs, in order.
+			wantWarnings []string
+		}{
+			// Another cache type, accepted with both named
+			{
+				name:      "an emptyDir PV in memory mounts on a node disk cache",
+				nodeCache: disk,
+				volumeCtx: map[string]string{"cache": "emptyDir", "cacheEmptyDirMedium": "Memory"},
+				wantWarnings: []string{
+					"requests an emptyDir (medium Memory) cache, but s3-csi-daemonset-mounter on this node provides emptyDir, which it uses",
+					`sets the deprecated volume attributes ["cacheEmptyDirMedium"]`,
+				},
+			},
+			{
+				name:             "an ephemeral PV of another StorageClass mounts on the node's ephemeral cache, capped at 95% of its request",
+				nodeCache:        gp3,
+				volumeCtx:        map[string]string{"cache": "ephemeral", "cacheEphemeralStorageClassName": "nvme-ssd", "cacheEphemeralStorageResourceRequest": "10Gi"},
+				wantMaxCacheSize: "9728",
+				wantWarnings: []string{
+					"requests an ephemeral (StorageClass nvme-ssd) cache, but s3-csi-daemonset-mounter on this node provides ephemeral (StorageClass gp3), which it uses",
+					`sets the deprecated volume attributes ["cacheEphemeralStorageClassName" "cacheEphemeralStorageResourceRequest"]`,
+					"so the driver injects 9728 MiB",
+				},
+			},
+			// Sizes
+			{
+				name:             "a `cache: enabled` PV that kept a v2 size is capped at 95% of it",
+				nodeCache:        disk,
+				volumeCtx:        map[string]string{"cache": "enabled", "cacheEphemeralStorageResourceRequest": "1Gi"},
+				wantMaxCacheSize: "972",
+				wantWarnings:     []string{`sets the deprecated volume attributes ["cacheEphemeralStorageResourceRequest"]`, "so the driver injects 972 MiB"},
+			},
+			{
+				// 100 PiB: multiplying its bytes by 95 in int64 wraps to a negative size.
+				name:             "a v2 size too large to multiply in int64 is still capped at 95%",
+				nodeCache:        disk,
+				volumeCtx:        map[string]string{"cache": "emptyDir", "cacheEmptyDirSizeLimit": "100Pi"},
+				wantMaxCacheSize: "102005473280",
+				wantWarnings: []string{
+					`sets the deprecated volume attributes ["cacheEmptyDirSizeLimit"]`,
+					`sets no --max-cache-size in its mountOptions, so the driver injects 102005473280 MiB, 95% of its deprecated "cacheEmptyDirSizeLimit" volume attribute ("100Pi")`,
+				},
+			},
+			{
+				name:             "a PV's own max-cache-size wins over its v2 size",
+				nodeCache:        disk,
+				volumeCtx:        map[string]string{"cache": "emptyDir", "cacheEmptyDirSizeLimit": "2Gi"},
+				mountOptions:     []string{"max-cache-size 3000"},
+				wantMaxCacheSize: "3000",
+				wantWarnings:     []string{`sets the deprecated volume attributes ["cacheEmptyDirSizeLimit"]`},
+			},
+			{
+				name:      "an unparseable v2 size is named and caps nothing",
+				nodeCache: disk,
+				volumeCtx: map[string]string{"cache": "emptyDir", "cacheEmptyDirSizeLimit": "lots"},
+				wantWarnings: []string{
+					`sets the deprecated volume attributes ["cacheEmptyDirSizeLimit"]`,
+					`sets the "cacheEmptyDirSizeLimit" volume attribute to "lots", which is not a Kubernetes quantity, so the driver injects no --max-cache-size from it`,
+				},
+			},
+			// Misc
+			{
+				name:      "a PV that does not cache is warned about its v2 Mountpoint Pod settings, and gets no --max-cache-size",
+				nodeCache: disk,
+				volumeCtx: map[string]string{"cacheEmptyDirSizeLimit": "2Gi", "mountpointPodServiceAccountName": "mp-sa",
+					"mountpointContainerResourcesRequestsCpu": "1", "mountpointContainerResourcesRequestsMemory": "1Gi",
+					"mountpointContainerResourcesLimitsCpu": "2", "mountpointContainerResourcesLimitsMemory": "1Gi"},
+				wantWarnings: []string{`sets the deprecated volume attributes ["cacheEmptyDirSizeLimit" "mountpointPodServiceAccountName"` +
+					` "mountpointContainerResourcesRequestsCpu" "mountpointContainerResourcesRequestsMemory" "mountpointContainerResourcesLimitsCpu"` +
+					` "mountpointContainerResourcesLimitsMemory"]`},
+			},
+			{
+				name:      "a v3 PV is not warned about",
+				nodeCache: disk,
+				volumeCtx: map[string]string{"cache": "enabled"},
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				testCtx := setupDM(t)
+				testCtx.setMounterPodCacheVolume(&corev1.Volume{Name: mounter.CacheVolumeName, VolumeSource: testCase.nodeCache})
+				logs := captureKlog(t)
+
+				got := testCtx.mountAndServe("pod-a-uid", testCase.volumeCtx, testCase.mountOptions...)
+
+				gotArgs := mountpoint.ParseArgs(got.Args)
+				maxCacheSize, hasMaxCacheSize := gotArgs.Value(mountpoint.ArgMaxCacheSize)
+				assert.Equals(t, testCase.wantMaxCacheSize != "", hasMaxCacheSize)
+				assert.Equals(t, testCase.wantMaxCacheSize, maxCacheSize)
+
+				klog.Flush()
+				var warnings []string
+				for _, line := range strings.Split(logs.String(), "\n") {
+					if strings.HasPrefix(line, "W") && strings.Contains(line, "NodePublishVolume: volume s3-csi-driver-volume ") {
+						warnings = append(warnings, line)
+					}
+				}
+				if len(warnings) != len(testCase.wantWarnings) {
+					t.Fatalf("expected %d warnings, got %d:\n%s", len(testCase.wantWarnings), len(warnings), strings.Join(warnings, "\n"))
+				}
+				for i, want := range testCase.wantWarnings {
+					assert.Contains(t, warnings[i], want)
+				}
+			})
+		}
+	})
+
+	t.Run("Warns once per new target, not on republishes", func(t *testing.T) {
+		testCtx := setupDMWithCache(t)
+		logs := captureKlog(t)
+		// The deprecated mount option with a v2 size, so the option's, the attributes' and the injection's warnings all fire.
+		volumeCtx := map[string]string{"cacheEmptyDirSizeLimit": "2Gi"}
+		const mountOption = "cache /tmp/customer-path"
+
+		testCtx.mountAndServe("pod-a-uid", volumeCtx, mountOption)
+		// Two republishes, then a pod joining the mount, which is a new target.
+		for _, podUID := range []string{"pod-a-uid", "pod-a-uid", "pod-b-uid"} {
+			assert.NoError(t, testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath(podUID),
+				testCtx.driverProvideCtx(podUID), volumeCtx, mountpoint.ParseArgs([]string{mountOption}), "", nil))
+		}
+
+		klog.Flush()
+		assert.Equals(t, 2, strings.Count(logs.String(), "deprecated `cache` mount option"))
+		assert.Equals(t, 2, strings.Count(logs.String(), "sets the deprecated volume attributes"))
+		assert.Equals(t, 2, strings.Count(logs.String(), "so the driver injects"))
+	})
+
+	t.Run("Keeps the --max-cache-size injected from a v2 size out of the pod-sharing key", func(t *testing.T) {
+		testCtx := setupDMWithCache(t)
+
+		got := testCtx.mountAndServe("pod-a-uid", map[string]string{"cache": "emptyDir", "cacheEmptyDirSizeLimit": "2Gi"})
+		gotArgs := mountpoint.ParseArgs(got.Args)
+		maxCacheSize, _ := gotArgs.Value(mountpoint.ArgMaxCacheSize)
+		assert.Equals(t, "1945", maxCacheSize)
+
+		// A joining pod's options must match the key, and .meta.json keeps it across s3-csi-node restarts.
+		data, err := os.ReadFile(mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		assert.NoError(t, err)
+		var meta mounter.MountMeta
+		assert.NoError(t, json.Unmarshal(data, &meta))
+		assert.Equals(t, []string{"--cache"}, meta.MountOptions)
 	})
 
 	// Rediscovery

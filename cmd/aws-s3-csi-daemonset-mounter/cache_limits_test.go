@@ -274,7 +274,7 @@ func TestCacheLimitWarnings(t *testing.T) {
 			name:     "equalSplit names the PV's size it ignores",
 			newLimit: func(t *testing.T) cacheLimit { return mustCacheLimit(t, cacheLimitEqualSplit, 4*gib, 4) },
 			args:     []string{cacheArg, "--max-cache-size=8192"},
-			wantWarn: "Ignoring --max-cache-size=8192 for volume vol-test",
+			wantWarn: "Ignoring --max-cache-size=8192 for volume vol-test: cache.limitStrategy=equalSplit gives every Mountpoint on this node an equal 972 MiB share of this container's cache volume. Remove --max-cache-size from the PV mountOptions, and any v2 cache size.",
 		},
 		{
 			name:     "equalSplit does not warn when the PV sets no size",
