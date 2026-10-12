@@ -63,6 +63,8 @@ func tmpfsCacheBytes(medium string, capacityBytes int64) int64 {
 type cacheLimit struct {
 	strategy cacheLimitStrategy
 	shareMiB int64 // under equalSplit, what each Mountpoint gets; 0 otherwise
+	// Under equalSplit, shareMiB times maxVolumesPerNode, which the caches held together may not exceed; 0 otherwise.
+	budgetMiB int64
 }
 
 // newCacheLimit resolves the strategy once at startup, logging the inputs it used so `kubectl logs`
@@ -102,7 +104,7 @@ func newCacheLimit(strategy cacheLimitStrategy, capacityBytes int64, maxVolumesP
 		"of %d bytes, divided by maxVolumesPerNode=%d).",
 		cacheLimitEqualSplit, mountpoint.ArgMaxCacheSize, shareMiB, cacheMarginPercent, capacityBytes,
 		maxVolumesPerNode)
-	return cacheLimit{strategy: strategy, shareMiB: shareMiB}, nil
+	return cacheLimit{strategy: strategy, shareMiB: shareMiB, budgetMiB: shareMiB * maxVolumesPerNode}, nil
 }
 
 // maxCacheSizeFor returns the `--max-cache-size` to pass to a mount's Mountpoint, reading what the PV's

@@ -100,8 +100,8 @@ func recordChowns(pm *ProcessManager) map[string][2]int {
 	return owners
 }
 
-// createUnremovableCacheEntry creates an entry in cacheDir that the test user cannot remove, so its removal fails.
-func createUnremovableCacheEntry(t *testing.T, cacheDir, entryName string) {
+// createUnremovableCacheEntry creates an entry in cacheDir that the test user cannot remove until unlock is called, so its removal fails.
+func createUnremovableCacheEntry(t *testing.T, cacheDir, entryName string) (unlock func()) {
 	t.Helper()
 	// Assert, not skip: CI is unprivileged, so a root run must fail loudly rather than lose this case.
 	assert.Equals(t, false, os.Geteuid() == 0)
@@ -110,13 +110,32 @@ func createUnremovableCacheEntry(t *testing.T, cacheDir, entryName string) {
 	assert.NoError(t, os.MkdirAll(lockedDir, 0700))
 	assert.NoError(t, os.WriteFile(filepath.Join(lockedDir, "block"), []byte("x"), 0600))
 	assert.NoError(t, os.Chmod(lockedDir, 0500))
-	t.Cleanup(func() { os.Chmod(lockedDir, 0700) })
+	unlock = func() { os.Chmod(lockedDir, 0700) }
+	t.Cleanup(unlock)
+	return unlock
 }
 
 func assertNotExist(t *testing.T, path string) {
 	t.Helper()
 	_, err := os.Lstat(path)
 	assert.Equals(t, true, errors.Is(err, fs.ErrNotExist))
+}
+
+// waitAndAssertUID polls until uid's entry in pm.processes is want; the zero want means uid is free.
+func waitAndAssertUID(t *testing.T, pm *ProcessManager, uid uint32, want mountpointProcess) {
+	t.Helper()
+	// 2s only bounds the failing case.
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		pm.mu.Lock()
+		got := pm.processes[uid]
+		pm.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("UID %d's entry is %+v, want %+v", uid, got, want)
+		}
+	}
 }
 
 // --- Tests ---
@@ -553,28 +572,92 @@ func TestProcessManager_Launch_CacheDir(t *testing.T) {
 		assertNotExist(t, filepath.Join(cacheDir, dirName))
 	})
 
-	t.Run("removes the directory and its contents once Mountpoint exits, before freeing the mount", func(t *testing.T) {
+	t.Run("frees the mount ID once Mountpoint exits, but refuses its UID until the directory and its contents are deleted", func(t *testing.T) {
 		fr := &fakeProcessRunner{}
 		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
-		mountCacheDir := filepath.Join(cacheDir, dirName)
+		pm.deleteRetryDelayForTesting = 10 * time.Millisecond
 		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", cachedOptions(t)))
 		// A killed Mountpoint leaves its blocks behind; a clean exit would have removed mountpoint-cache itself.
-		blockDir := filepath.Join(mountCacheDir, "mountpoint-cache", "V2", "ab")
-		assert.NoError(t, os.MkdirAll(blockDir, 0700))
-		assert.NoError(t, os.WriteFile(filepath.Join(blockDir, "block"), []byte("x"), 0600))
+		// Locked, so its deletion fails until we unlock it.
+		unlock := createUnremovableCacheEntry(t, cacheDir, dirName)
 
-		// While we hold the lock, the waiter cannot free the mount ID, so the directory must be removed before that.
-		pm.mu.Lock()
 		fr.handles[0].Exit(137, "")
-		dirGone := false
-		// 2s only bounds the failing case.
-		for deadline := time.Now().Add(2 * time.Second); !dirGone && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			_, err := os.Lstat(mountCacheDir)
-			dirGone = errors.Is(err, fs.ErrNotExist)
-		}
-		pm.mu.Unlock()
-		assert.Equals(t, true, dirGone)
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{deletingCache: true})
 
+		// The node's retry for the same PV carries a new UID, and is served while the old directory is being deleted.
+		retry := cachedOptions(t)
+		retry.Uid, retry.Gid = 65537, 65537
+		assert.NoError(t, pm.Launch(mountId, "/usr/bin/mount-s3", retry))
+		err := pm.Launch("mount-b", "/usr/bin/mount-s3", cachedOptions(t))
+		if err == nil {
+			t.Fatal("expected a launch as a UID whose cache is still being deleted to be refused")
+		}
+		assert.Contains(t, err.Error(), "the previous cache of UID 65536 has not been deleted yet")
+
+		unlock()
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{})
+		assertNotExist(t, filepath.Join(cacheDir, dirName))
+
+		fr.handles[1].Exit(0, "")
+		// Removable, so the first attempt deletes it and frees the UID.
+		waitAndAssertUID(t, pm, 65537, mountpointProcess{})
+		pm.Shutdown()
+	})
+
+	t.Run("under equalSplit, refuses a cache while those held, running or still being deleted, fill the cache volume, and serves it once one is deleted", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		// Room for four caches of 972 MiB: 4 GiB * 95% / 4.
+		pm, cacheDir := newProcessManagerWithCache(t, fr, mustCacheLimit(t, cacheLimitEqualSplit, 4*gib, 4))
+		pm.deleteRetryDelayForTesting = 10 * time.Millisecond
+		for i := range 4 {
+			options := cachedOptions(t)
+			options.Uid, options.Gid = uint32(65536+i), uint32(65536+i)
+			assert.NoError(t, pm.Launch(fmt.Sprintf("pv-%d", i), "/usr/bin/mount-s3", options))
+		}
+		unlock := createUnremovableCacheEntry(t, cacheDir, dirName)
+		fr.handles[0].Exit(137, "")
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{deletingCache: true, cacheMiB: 972})
+
+		fifth := cachedOptions(t)
+		fifth.Uid, fifth.Gid = 65540, 65540
+		err := pm.Launch("pv-4", "/usr/bin/mount-s3", fifth)
+		if err == nil {
+			t.Fatal("expected a fifth cache to be refused while the first is still being deleted")
+		}
+		assert.Contains(t, err.Error(), "refusing to launch mount pv-4: its 972 MiB cache does not fit in the 0 MiB left on the cache volume")
+		// The error reaches pv-4's pod events, so it names no other mount.
+		assert.Equals(t, 1, strings.Count(err.Error(), "pv-"))
+		// The refusal comes before any side effect, so pv-4 has no directory yet.
+		assertNotExist(t, filepath.Join(cacheDir, "uid-65540"))
+		// An uncached mount holds no cache, so it is served on a full volume and pv-4 below still fits.
+		uncached := cachedOptions(t)
+		uncached.Args, uncached.Uid, uncached.Gid = nil, 65541, 65541
+		assert.NoError(t, pm.Launch("pv-uncached", "/usr/bin/mount-s3", uncached))
+
+		unlock()
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{})
+		fifth = cachedOptions(t)
+		fifth.Uid, fifth.Gid = 65540, 65540
+		assert.NoError(t, pm.Launch("pv-4", "/usr/bin/mount-s3", fifth))
+
+		for _, h := range fr.handles[1:] {
+			h.Exit(0, "")
+		}
+		pm.Shutdown()
+	})
+
+	t.Run("under none, never refuses a cache, whatever the PVs ask for", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, _ := newProcessManagerWithCache(t, fr, mustCacheLimit(t, cacheLimitNone, 4*gib, 4))
+		for i := range 5 {
+			options := cachedOptions(t, "--max-cache-size=3000")
+			options.Uid, options.Gid = uint32(65536+i), uint32(65536+i)
+			assert.NoError(t, pm.Launch(fmt.Sprintf("pv-%d", i), "/usr/bin/mount-s3", options))
+		}
+
+		for _, h := range fr.handles {
+			h.Exit(0, "")
+		}
 		pm.Shutdown()
 	})
 }
@@ -797,6 +880,55 @@ func TestProcessManager_ChownWithDefault(t *testing.T) {
 		assert.NoError(t, pm.chownWithDefault(dir, os.Getuid(), os.Getgid()))
 		if err := pm.chownWithDefault(link, os.Getuid(), os.Getgid()); err == nil {
 			t.Fatal("expected chownWithDefault to refuse a symlink")
+		}
+	})
+}
+
+func TestProcessManager_DeleteMountCacheDir(t *testing.T) {
+	t.Run("retries a failed deletion with a doubling delay, then gives up and keeps the UID taken until the mounter restarts", func(t *testing.T) {
+		pm, cacheDir := newProcessManagerWithCache(t, &fakeProcessRunner{}, cacheLimit{strategy: cacheLimitNone})
+		pm.deleteRetryDelayForTesting = 100 * time.Microsecond
+		createUnremovableCacheEntry(t, cacheDir, "uid-65536")
+		pm.processes[65536] = mountpointProcess{deletingCache: true}
+
+		start := time.Now()
+		pm.deleteMountCacheDir(65536)
+
+		// Nine retries 0.1, 0.2 ... 25.6 ms apart wait 51.1 ms, where a delay that never grows waits 0.9 ms.
+		assert.Equals(t, true, time.Since(start) >= 511*pm.deleteRetryDelayForTesting)
+		// 500ms leaves room for a loaded machine, yet fails a delay that triples (984 ms) or ignores deleteRetryDelayForTesting (9 s or more).
+		assert.Equals(t, true, time.Since(start) < 500*time.Millisecond)
+		assert.Equals(t, true, pm.processes[65536].deletingCache)
+	})
+
+	t.Run("stops retrying at once when the mounter shuts down, so Shutdown does not wait for it", func(t *testing.T) {
+		fr := &fakeProcessRunner{}
+		pm, cacheDir := newProcessManagerWithCache(t, fr, cacheLimit{strategy: cacheLimitNone})
+		// Shutdown returns within the 2s below only if it cuts this wait short.
+		pm.deleteRetryDelayForTesting = time.Hour
+		dev := mountertest.OpenDevNull(t)
+		assert.NoError(t, pm.Launch("mount-123", "/usr/bin/mount-s3", mountoptions.Options{
+			Fd:         int(dev.Fd()),
+			BucketName: "my-bucket",
+			Args:       []string{"--cache"},
+			Uid:        65536,
+			Gid:        65536,
+		}))
+		createUnremovableCacheEntry(t, cacheDir, "uid-65536")
+		// A clean exit, the usual unmount, keeps the UID taken too.
+		fr.handles[0].Exit(0, "")
+		waitAndAssertUID(t, pm, 65536, mountpointProcess{deletingCache: true})
+
+		returned := make(chan struct{})
+		go func() {
+			pm.Shutdown()
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		// 2s only bounds the failing case.
+		case <-time.After(2 * time.Second):
+			t.Fatal("Shutdown waited for a failed cache deletion to be retried")
 		}
 	})
 }
