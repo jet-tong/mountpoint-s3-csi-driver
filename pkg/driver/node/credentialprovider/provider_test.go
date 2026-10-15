@@ -10,7 +10,6 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -1375,9 +1374,8 @@ func serviceAccountTokens(t *testing.T, tokens tokens) string {
 }
 
 func serviceAccount(name, namespace string, annotations map[string]string) *v1.ServiceAccount {
-	return &v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+	return &v1.ServiceAccount{
 		Name:        name,
 		Namespace:   namespace,
-		Annotations: annotations,
-	}}
+		Annotations: annotations}
 }

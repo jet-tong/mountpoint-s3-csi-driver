@@ -63,7 +63,7 @@ sidecars:
   nodeDriverRegistrar:
     image:
       repository: public.ecr.aws/csi-components/csi-node-driver-registrar
-      tag: v2.17.0-eksbuild.7
+      tag: v2.18.0-eksbuild.1
       pullPolicy: IfNotPresent
     env:
       - name: KUBE_NODE_NAME
@@ -79,7 +79,7 @@ sidecars:
   livenessProbe:
     image:
       repository: public.ecr.aws/csi-components/livenessprobe
-      tag: v2.19.0-eksbuild.7
+      tag: v2.20.0-eksbuild.1
       pullPolicy: IfNotPresent
     volumeMounts:
       - mountPath: /csi
@@ -97,6 +97,8 @@ controller:
     # Specifies whether a service account should be created
     create: true
     name: s3-csi-driver-controller-sa
+  # Only one controller is active at once, even with higher `replicaCount`s.
+  replicaCount: 1
 
 mountpointPod:
   # NOTE: `namespace` is still required in daemonset (V3) mode — the drain-only controller uses it to

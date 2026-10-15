@@ -116,9 +116,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, handle.Pid())
 
-	pm.wg.Add(1)
-	go func() {
-		defer pm.wg.Done()
+	pm.wg.Go(func() {
 		exitCode, stderr := handle.Wait()
 
 		pm.mu.Lock()
@@ -131,7 +129,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		} else {
 			klog.Infof("Mountpoint for mount %s exited cleanly", mountId)
 		}
-	}()
+	})
 
 	return nil
 }
