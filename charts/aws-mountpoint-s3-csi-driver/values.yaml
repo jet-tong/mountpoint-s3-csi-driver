@@ -213,7 +213,7 @@ daemonsetMounters:
     #                  a 4Gi volume gives each of 4 Mountpoint processes 972Mi. Recommended. The volume's size is
     #                  required, as is a non-zero maxVolumesPerNode, and a `max-cache-size` in a
     #                  PV's mountOptions is ignored with a warning.
-    #   "none"       - --max-cache-size is left to each PV's mountOptions, and we recommend setting it
+    #   "none"       - --max-cache-size is left to each PV's mountOptions, else 95% of a v2 PV's cache size, and we recommend setting it
     #                  on every PV that caches to prevent unbounded cache growth, before applying this
     #                  strategy.
 
