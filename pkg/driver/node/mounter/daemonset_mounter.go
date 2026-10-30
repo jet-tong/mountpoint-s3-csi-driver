@@ -91,8 +91,8 @@ var (
 type mounterPod struct {
 	// comm directory for communicating with mounter pod.
 	commDir string
-	// hasCacheVolume is whether the mounter pod mounts a volume named `cache` for its Mountpoints.
-	hasCacheVolume bool
+	// cacheVolume is the volume named `cache` the mounter pod mounts for its Mountpoints, or nil if it has none.
+	cacheVolume *corev1.Volume
 }
 
 // mountSyscallFunc performs the FUSE mount and returns the fd. Injectable for testing.
@@ -268,8 +268,11 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return fmt.Errorf("connection to s3-csi-daemonset-mounter not yet established, allowing kubelet to retry NodePublishVolume: %w. %s", ErrCommDirNotReady, helpMessageForCheckingMounterPodStatus())
 	}
 
+	// The kubelet republishes a mounted target periodically, so a PV's deprecated settings are warned about on a new target only.
+	newTarget := targetState == TargetAbsent
+
 	// Decide whether this mount caches, rejecting a cache request this node cannot serve.
-	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.hasCacheVolume)
+	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.cacheVolume != nil, newTarget)
 	if err != nil {
 		return err
 	}
@@ -281,17 +284,23 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	if caches {
 		args.Set(mountpoint.ArgCache, mountpoint.ArgNoValue)
 	}
+	// Only a new target can start a Mountpoint, the one place a v2 cache size is used.
+	var v2MaxCacheSize string
+	if newTarget {
+		warnDeprecatedCacheSettings(volumeCtx, volumeID, mounter.cacheVolume)
+		v2MaxCacheSize = maxCacheSizeFromDeprecatedPVSizes(args, volumeCtx, volumeID)
+	}
 
 	// All paths (republish, share, new mount) go through mountOrShareSource
 	// which holds the per-volume lock and validates compatibility before any
 	// credential writes.
-	return dm.mountOrShareSource(ctx, bucketName, target, volumeID, mounter.commDir, credentialCtx, args, fsGroup, userEnv, targetState == TargetHealthy)
+	return dm.mountOrShareSource(ctx, bucketName, target, volumeID, mounter.commDir, credentialCtx, args, v2MaxCacheSize, fsGroup, userEnv, targetState == TargetHealthy)
 }
 
 // mountOrShareSource implements the pod-sharing Mount flow using MountMap.
 func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName string, target string,
 	volumeID string, commDir string, credentialCtx credentialprovider.ProvideContext,
-	args mountpoint.Args, fsGroup string, userEnv envprovider.Environment, targetIsMounted bool) error {
+	args mountpoint.Args, v2MaxCacheSize string, fsGroup string, userEnv envprovider.Environment, targetIsMounted bool) error {
 
 	entry := dm.lockCanonicalEntry(volumeID)
 	defer entry.mu.Unlock()
@@ -357,7 +366,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 
 	// New mount: FUSE mount at source, then bind to target.
 
-	if err := dm.fuseMount(ctx, bucketName, entry.SourcePath, volumeID, commDir, entry.Uid, args, userEnv, credsEnv, authSource); err != nil {
+	if err := dm.fuseMount(ctx, bucketName, entry.SourcePath, volumeID, commDir, entry.Uid, args, v2MaxCacheSize, userEnv, credsEnv, authSource); err != nil {
 		if tearErr := dm.teardownEntry(volumeID, entry, credentialCtx.ToCleanupCtx()); tearErr != nil {
 			klog.Errorf("DaemonsetMounter: cleanup after fuseMount failed for volume %s: %v (will retry)", volumeID, tearErr)
 		}
@@ -473,7 +482,7 @@ func (dm *DaemonsetMounter) prepareFreshMount(entry *MountEntry, volumeID, commD
 // Credentials are already provisioned by the caller (Mount).
 // commDir comes from the caller's single mounterPod load per NodePublishVolume.
 func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mountPath string,
-	volumeID string, commDir string, uid uint32, args mountpoint.Args, userEnv envprovider.Environment, credsEnv envprovider.Environment, authSource credentialprovider.AuthenticationSource) error {
+	volumeID string, commDir string, uid uint32, args mountpoint.Args, v2MaxCacheSize string, userEnv envprovider.Environment, credsEnv envprovider.Environment, authSource credentialprovider.AuthenticationSource) error {
 
 	if err := os.MkdirAll(mountPath, targetDirPerm); err != nil {
 		return fmt.Errorf("failed to create mount directory %q: %w", mountPath, err)
@@ -505,6 +514,11 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	mpUID := strconv.FormatInt(*cluster.DefaultMountpointUID, 10)
 	args.SetIfAbsent(mountpoint.ArgUid, mpUID)
 	args.SetIfAbsent(mountpoint.ArgGid, mpUID)
+
+	// Also after the pod-sharing key: a republish computes no v2 size, so a key holding one would fail every republish.
+	if v2MaxCacheSize != "" {
+		args.SetIfAbsent(mountpoint.ArgMaxCacheSize, v2MaxCacheSize)
+	}
 
 	env := envprovider.Environment{}
 	env.Merge(userEnv)
@@ -1419,7 +1433,7 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 }
 
 // tryDiscoverMounter performs a single attempt to find the secondary mounter pod on this node and
-// resolve its comm dir, as seen from the primary daemonset, and whether it has a cache volume.
+// resolve its comm dir, as seen from the primary daemonset, and its cache volume.
 func (dm *DaemonsetMounter) tryDiscoverMounter(ctx context.Context) (*mounterPod, error) {
 	pods, err := dm.clientset.CoreV1().Pods(mounterNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: mounterPodLabel,
@@ -1445,13 +1459,13 @@ func (dm *DaemonsetMounter) tryDiscoverMounter(ctx context.Context) (*mounterPod
 
 	podUID := string(running[0].UID)
 	commDir := filepath.Join(dm.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~empty-dir", CommVolumeName)
-	hasCacheVolume := mounterPodHasCacheVolume(running[0])
+	cacheVolume := mounterPodCacheVolume(running[0])
 
 	klog.V(4).Infof("DaemonsetMounter: discovered mounter pod %s (uid=%s), comm dir: %s, cache volume: %t",
-		running[0].Name, podUID, commDir, hasCacheVolume)
+		running[0].Name, podUID, commDir, cacheVolume != nil)
 	return &mounterPod{
-		commDir:        commDir,
-		hasCacheVolume: hasCacheVolume,
+		commDir:     commDir,
+		cacheVolume: cacheVolume,
 	}, nil
 }
 

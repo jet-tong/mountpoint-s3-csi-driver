@@ -70,7 +70,7 @@ type cacheLimit struct {
 // so the caller is expected to exit rather than accept a config it cannot honour.
 func newCacheLimit(strategy cacheLimitStrategy, capacityBytes int64, maxVolumesPerNode int64) (cacheLimit, error) {
 	if strategy == cacheLimitNone {
-		klog.Infof("cache.limitStrategy=%s: %s is left to each PV's mountOptions.",
+		klog.Infof("cache.limitStrategy=%s: %s is left to each PV's mountOptions, else 95%% of a v2 PV's cache size.",
 			strategy, mountpoint.ArgMaxCacheSize)
 		return cacheLimit{strategy: strategy}, nil
 	}
@@ -130,7 +130,7 @@ func (l cacheLimit) maxCacheSizeFor(volumeId string, args mountpoint.Args) (size
 
 	if hasDeclared {
 		klog.Warningf("Ignoring %s=%s for volume %s: cache.limitStrategy=%s gives every Mountpoint on this "+
-			"node an equal %d MiB share of this container's cache volume. Remove %s from the PV mountOptions.",
+			"node an equal %d MiB share of this container's cache volume. Remove %s from the PV mountOptions, and any v2 cache size.",
 			mountpoint.ArgMaxCacheSize, declared, volumeId, cacheLimitEqualSplit, l.shareMiB, mountpoint.ArgMaxCacheSize)
 	}
 
