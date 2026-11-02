@@ -101,8 +101,8 @@ var (
 type mounterPod struct {
 	// comm directory for communicating with mounter pod.
 	commDir string
-	// hasCacheVolume is whether the mounter pod mounts a volume named `cache` for its Mountpoints.
-	hasCacheVolume bool
+	// cacheVolume is the volume named `cache` the mounter pod mounts for its Mountpoints, or nil if it has none.
+	cacheVolume *corev1.Volume
 	// image is the mounter container's `image:` ("" if the container is missing). It is fixed for the
 	// pod's lifetime; a new mounter pod gets a new comm dir, which triggers re-discovery.
 	image string
@@ -295,8 +295,11 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return err
 	}
 
+	// The kubelet republishes a mounted target periodically, so a PV's deprecated settings are warned about on a new target only.
+	newTarget := targetState == TargetAbsent
+
 	// Decide whether this mount caches, rejecting a cache request this node cannot serve.
-	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.hasCacheVolume)
+	caches, err := validateCacheRequest(args, volumeCtx, volumeID, mounter.cacheVolume != nil, newTarget)
 	if err != nil {
 		return err
 	}
@@ -307,6 +310,9 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	// The mounter picks the PV's directory
 	if caches {
 		args.Set(mountpoint.ArgCache, mountpoint.ArgNoValue)
+	}
+	if newTarget {
+		warnDeprecatedCacheSettings(volumeCtx, volumeID, mounter.cacheVolume)
 	}
 
 	// All paths (republish, share, new mount) go through mountOrShareSource
@@ -1446,7 +1452,7 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 }
 
 // tryDiscoverMounter performs a single attempt to find the secondary mounter pod on this node and
-// resolve its comm dir, as seen from the primary daemonset, and whether it has a cache volume.
+// resolve its comm dir, as seen from the primary daemonset, and its cache volume.
 func (dm *DaemonsetMounter) tryDiscoverMounter(ctx context.Context) (*mounterPod, error) {
 	pods, err := dm.clientset.CoreV1().Pods(mounterNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: mounterPodLabel,
@@ -1472,15 +1478,15 @@ func (dm *DaemonsetMounter) tryDiscoverMounter(ctx context.Context) (*mounterPod
 
 	podUID := string(running[0].UID)
 	commDir := filepath.Join(dm.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~empty-dir", CommVolumeName)
-	hasCacheVolume := mounterPodHasCacheVolume(running[0])
+	cacheVolume := mounterPodCacheVolume(running[0])
 	image := mounterPodImage(running[0])
 
 	klog.V(4).Infof("DaemonsetMounter: discovered mounter pod %s (uid=%s), comm dir: %s, cache volume: %t, image: %s",
-		running[0].Name, podUID, commDir, hasCacheVolume, image)
+		running[0].Name, podUID, commDir, cacheVolume != nil, image)
 	return &mounterPod{
-		commDir:        commDir,
-		hasCacheVolume: hasCacheVolume,
-		image:          image,
+		commDir:     commDir,
+		cacheVolume: cacheVolume,
+		image:       image,
 	}, nil
 }
 
