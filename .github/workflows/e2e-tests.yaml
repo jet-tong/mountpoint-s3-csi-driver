@@ -149,12 +149,14 @@ jobs:
         run: |
           tests/e2e-kubernetes/scripts/run.sh
       - name: Summarize E2E test report
+        id: summary
         if: always()
         # Reporting only: this and the upload never fail the job.
         continue-on-error: true
         run: tests/e2e-kubernetes/scripts/generate_test_summary.py tests/e2e-kubernetes/csi-test-artifacts/test-report.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload E2E test report
-        if: always()
+        # Only when there is something to look at: a failed step, or a spec that passed only on a retry.
+        if: failure() || steps.summary.outputs.flaked == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
