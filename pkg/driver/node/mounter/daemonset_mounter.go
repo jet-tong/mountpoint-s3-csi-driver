@@ -1468,12 +1468,12 @@ func (dm *DaemonsetMounter) reclaimHandle(meta *MountMeta) error {
 }
 
 // RebuildMountMap reconstructs the MountMap from disk on driver startup.
-// It scans the meta directory for .meta.json files, verifies each source mount
+// It scans the meta directory for meta.json files, verifies each source mount
 // is still alive via /proc/self/mountinfo, and counts bind mounts (targets) by
 // matching device IDs.
 //
 // Algorithm:
-//  1. List all .meta.json files in the plugins/s3.csi.aws.com/meta/ directory
+//  1. List the volume directories in the plugins/s3.csi.aws.com/meta/ directory
 //  2. For each meta file, parse the JSON to get MountMeta
 //  3. Scan /proc/self/mountinfo to find the source mount and its device ID
 //  4. Count bind mounts sharing that device ID (these are the targets)
@@ -1498,12 +1498,20 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 	}
 
 	for _, dirEntry := range entries {
-		if !strings.HasSuffix(dirEntry.Name(), ".meta.json") {
+		if !dirEntry.IsDir() {
 			continue
 		}
 
-		metaPath := filepath.Join(metaDir, dirEntry.Name())
+		metaPath := MetaFileName(dm.kubeletPath, dirEntry.Name())
 		meta, err := readMeta(metaPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			// No mount was recorded: WriteMeta stopped before its rename, or RemoveMeta before removing the directory.
+			continue
+		}
+		// The directory is named for its volume, so a meta file naming another, or none, is corrupt.
+		if err == nil && meta.VolumeID != dirEntry.Name() {
+			err = fmt.Errorf("it names volume %q", meta.VolumeID)
+		}
 		if err != nil {
 			// Fail closed: an unreadable/corrupt meta must abort rebuild (driver.go turns this into
 			// a fatal), not be silently skipped — skipping would leak the volume's commDir/credentials
