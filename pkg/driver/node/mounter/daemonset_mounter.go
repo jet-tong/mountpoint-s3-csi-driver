@@ -64,10 +64,10 @@ import (
 )
 
 const (
-	mounterPodLabel  = "app=s3-csi-daemonset-mounter"
-	CommVolumeName   = "comm"
-	MountSockName    = "mount.sock"
-	MountErrorSuffix = ".error"
+	mounterPodLabel = "app=s3-csi-daemonset-mounter"
+	CommVolumeName  = "comm"
+	MountSockName   = "mount.sock"
+	MountsDirName   = "mounts"
 
 	// TODO: lower sendOptionsTimeout once secondary has concurrent accept to reduce blocks on Mount -> Send -> dialWithRetry
 	sendOptionsTimeout = 15 * time.Second
@@ -615,8 +615,12 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	}
 
 	sockPath := filepath.Join(mounter.commDir, MountSockName)
-	errFilePath := filepath.Join(mounter.commDir, GetErrorFileName(volumeID))
-	os.Remove(errFilePath)
+	errFileName := GetErrorFileName(volumeID)
+	// Removed through a root on the comm directory, which the mounter can write, so a link planted there cannot lead outside it.
+	if root, err := os.OpenRoot(mounter.commDir); err == nil {
+		root.Remove(errFileName)
+		root.Close()
+	}
 
 	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", volumeID, sockPath)
 
@@ -645,7 +649,7 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	dm.closeFUSEDevFD(fd)
 	fdClosed = true
 
-	err = dm.waitForMount(ctx, mountPath, volumeID, errFilePath)
+	err = dm.waitForMount(ctx, mountPath, volumeID, mounter.commDir, errFileName)
 	if err != nil {
 		return err
 	}
@@ -875,9 +879,9 @@ func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
 	dm.mountMap.Delete(volumeID)
 }
 
-// GetErrorFileName returns the error file name for a given volume ID.
+// GetErrorFileName returns the error file path for a given volume ID, relative to the comm directory.
 func GetErrorFileName(volumeID string) string {
-	return volumeID + MountErrorSuffix
+	return filepath.Join(MountsDirName, volumeID, "error")
 }
 
 // cleanupMount removes all resources associated with a mount entry.
@@ -886,15 +890,10 @@ func GetErrorFileName(volumeID string) string {
 func (dm *DaemonsetMounter) cleanupMount(entry *MountEntry, credentialCtx credentialprovider.CleanupContext) error {
 	var errs []error
 
-	// Clean credential files and error file (both live in commDir)
+	// Clean credential files and error file (both live in the mount's directory in commDir)
 	if entry.CommDir != "" {
 		if err := dm.cleanupCredentials(entry.CommDir, entry.VolumeID, credentialCtx); err != nil {
 			klog.Errorf("DaemonsetMounter: cleanup credentials for volume %s: %v", entry.VolumeID, err)
-			errs = append(errs, err)
-		}
-		errFile := filepath.Join(entry.CommDir, GetErrorFileName(entry.VolumeID))
-		if err := os.Remove(errFile); err != nil && !os.IsNotExist(err) {
-			klog.Errorf("DaemonsetMounter: cleanup error file %s: %v", errFile, err)
 			errs = append(errs, err)
 		}
 	}
@@ -1269,7 +1268,7 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, vol
 		return nil, "", fmt.Errorf("failed to create credential directory: %w", err)
 	}
 	credentialCtx.WritePath = mountCredDir
-	credentialCtx.EnvPath = filepath.Join("/comm", volumeID)
+	credentialCtx.EnvPath = filepath.Join("/comm", MountsDirName, volumeID, "credentials")
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
 	credentialCtx.Uid = uid
 
@@ -1281,18 +1280,28 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, vol
 	return env, authSource, nil
 }
 
-// cleanupCredentials removes the per-mount credential directory.
+// cleanupCredentials removes the per-mount directory, with its credentials and error file.
 func (dm *DaemonsetMounter) cleanupCredentials(commDir, volumeID string, cleanupCtx credentialprovider.CleanupContext) error {
-	mountCredDir := filepath.Join(commDir, volumeID)
-	cleanupCtx.WritePath = mountCredDir
+	mountDir := filepath.Join(MountsDirName, volumeID)
+	// Removed through a root on the comm directory, which the mounter can write, so a link planted there cannot lead
+	// outside it. First, so such a link is gone before the provider's cleanup, which, like its writes, still goes by
+	// path and can be steered by a link the mounter swaps in meanwhile.
+	root, err := os.OpenRoot(commDir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// The comm directory went with its mounter pod, and the mount's directory with it.
+	case err != nil:
+		return err
+	default:
+		err = root.RemoveAll(mountDir)
+		root.Close()
+		if err != nil {
+			return err
+		}
+	}
+	cleanupCtx.WritePath = filepath.Join(commDir, mountDir, "credentials")
 	cleanupCtx.MountKind = credentialprovider.MountKindDaemonset
-	if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(mountCredDir); err != nil {
-		return err
-	}
-	return nil
+	return dm.credProvider.Cleanup(cleanupCtx)
 }
 
 // DiscoverMounter discovers the mounter pod on this node synchronously with retries.
@@ -1708,7 +1717,15 @@ func (dm *DaemonsetMounter) imageMismatchWarning(mounterImage string) string {
 }
 
 // waitForMount waits until Mountpoint is serving at target or an error occurs.
-func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, volumeID, errFilePath string) error {
+func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, volumeID, commDir, errFileName string) error {
+	// Read through a root on the comm directory, which the mounter can write, so a link planted there cannot
+	// put a file from outside it into the mount's error.
+	root, err := os.OpenRoot(commDir)
+	if err != nil {
+		return fmt.Errorf("failed to open comm dir to wait for mount %s: %w. %s", volumeID, err, helpMessageForGettingMounterLogs())
+	}
+	defer root.Close()
+
 	ctx, cancel := context.WithTimeout(parentCtx, mountReadyTimeout)
 	defer cancel()
 
@@ -1717,11 +1734,11 @@ func (dm *DaemonsetMounter) waitForMount(parentCtx context.Context, target, volu
 	// Poll for error file
 	go func() {
 		wait.PollUntilContextCancel(ctx, mountReadyPollInterval, true, func(ctx context.Context) (bool, error) {
-			content, err := os.ReadFile(errFilePath)
+			content, err := root.ReadFile(errFileName)
 			if err != nil {
 				return false, nil
 			}
-			os.Remove(errFilePath)
+			root.Remove(errFileName)
 			mountResultCh <- fmt.Errorf("Mountpoint for mount %s failed: %s", volumeID, string(content))
 			return true, nil
 		})

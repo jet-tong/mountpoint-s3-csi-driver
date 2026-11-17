@@ -107,8 +107,8 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		ginkgo.By("Reading the UID each of the two mounts was given")
 		commDir := commDirHostPath(ctx, f, targetNode)
 		uids := []int{
-			statPath(ctx, f, targetNode, filepath.Join(commDir, first.Pv.Name)).uid,
-			statPath(ctx, f, targetNode, filepath.Join(commDir, second.Pv.Name)).uid,
+			statPath(ctx, f, targetNode, filepath.Join(commDir, "mounts", first.Pv.Name, "credentials")).uid,
+			statPath(ctx, f, targetNode, filepath.Join(commDir, "mounts", second.Pv.Name, "credentials")).uid,
 		}
 		gomega.Expect(uids[0]).ToNot(gomega.Equal(uids[1]),
 			"two mounts on one node must be given different UIDs, both got %d", uids[0])
@@ -164,7 +164,7 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		gomega.Eventually(ctx, func(ctx context.Context) (int, error) {
 			return countFuseMountsForVolume(ctx, f, targetNode, pvName), nil
 		}).WithTimeout(mountpointProcessTimeout).WithPolling(mountpointProcessPoll).Should(gomega.Equal(1))
-		uid := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), pvName)).uid
+		uid := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), "mounts", pvName, "credentials")).uid
 
 		ginkgo.By(fmt.Sprintf("Attempting to switch from the mount's UID %d back to root", uid))
 		asMount := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", uid, uid)
@@ -207,8 +207,16 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		gomega.Expect(sock.uid).To(gomega.Equal(0))
 		gomega.Expect(sock.gid).To(gomega.Equal(0))
 
+		ginkgo.By("Checking the mount's directories above its credentials are root-owned and closed")
+		for _, dir := range []string{filepath.Join(commDir, "mounts"), filepath.Join(commDir, "mounts", pvName)} {
+			d := statPath(ctx, f, targetNode, dir)
+			gomega.Expect(d.mode).To(gomega.Equal(expectedCommDirMode), "mode of %s", dir)
+			gomega.Expect(d.uid).To(gomega.Equal(0), "owner of %s", dir)
+			gomega.Expect(d.gid).To(gomega.Equal(0), "group of %s", dir)
+		}
+
 		ginkgo.By("Checking the per-mount credential directory belongs to the mount's UID")
-		credDirPath := commDir + "/" + pvName
+		credDirPath := filepath.Join(commDir, "mounts", pvName, "credentials")
 		credDir := statPath(ctx, f, targetNode, credDirPath)
 		gomega.Expect(credDir.mode).To(gomega.Equal(expectedCredDirMode))
 		gomega.Expect(credDir.uid).To(gomega.And(
@@ -217,12 +225,19 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		), "credential directory for %s must belong to an allocated UID", pvName)
 		gomega.Expect(credDir.gid).To(gomega.Equal(credDir.uid))
 
-		ginkgo.By("Confirming a mount's UID can neither write to /comm nor open the mount socket")
+		ginkgo.By("Confirming a mount's UID can neither write to /comm or its own mount directory nor open the mount socket")
 		asMount := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", credDir.uid, credDir.uid)
 
 		out, stderr, err := execInMounterPod(ctx, f, targetNode, asMount+" touch /comm/planted")
 		gomega.Expect(err).To(gomega.HaveOccurred(),
 			"UID %d must not be able to create entries in /comm; got output %q", credDir.uid, out)
+		gomega.Expect(stderr).To(gomega.ContainSubstring("Permission denied"),
+			"UID %d must be refused by the kernel, but the failure was: %q", credDir.uid, stderr)
+
+		// Root writes and reads the error file here, so the mount's own Mountpoint must not be able to plant it.
+		out, stderr, err = execInMounterPod(ctx, f, targetNode, asMount+" touch /comm/mounts/"+pvName+"/error")
+		gomega.Expect(err).To(gomega.HaveOccurred(),
+			"UID %d must not be able to create its own error file; got output %q", credDir.uid, out)
 		gomega.Expect(stderr).To(gomega.ContainSubstring("Permission denied"),
 			"UID %d must be refused by the kernel, but the failure was: %q", credDir.uid, stderr)
 
@@ -259,7 +274,7 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		defer deletePodsInOrder(ctx, f, []*v1.Pod{pod})
 		targetNode := pod.Spec.NodeName
 
-		credDirPath := commDirHostPath(ctx, f, targetNode) + "/" + pvName
+		credDirPath := filepath.Join(commDirHostPath(ctx, f, targetNode), "mounts", pvName, "credentials")
 		credDir := statPath(ctx, f, targetNode, credDirPath)
 
 		// `-A` so a credential file whose name begins with a dot is listed too, without picking up "."
@@ -287,12 +302,12 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		l.resources = append(l.resources, other)
 		otherPods := createPodOnNode(ctx, f, targetNode, other)
 		defer deletePodsInOrder(ctx, f, otherPods)
-		otherUID := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), other.Pv.Name)).uid
+		otherUID := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), "mounts", other.Pv.Name, "credentials")).uid
 		gomega.Expect(otherUID).ToNot(gomega.Equal(credDir.uid), "the two mounts must have different UIDs")
 
 		asOther := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", otherUID, otherUID)
 		for _, file := range files {
-			tokenPath := fmt.Sprintf("/comm/%s/%s", pvName, file)
+			tokenPath := fmt.Sprintf("/comm/mounts/%s/credentials/%s", pvName, file)
 			ginkgo.By(fmt.Sprintf("Confirming UID %d cannot open %s", otherUID, tokenPath))
 			out, stderr, err := execInMounterPod(ctx, f, targetNode, asOther+" cat "+tokenPath)
 			gomega.Expect(err).To(gomega.HaveOccurred(),
@@ -322,13 +337,13 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 			return countFuseMountsForVolume(ctx, f, targetNode, pvName), nil
 		}).WithTimeout(mountpointProcessTimeout).WithPolling(mountpointProcessPoll).Should(gomega.Equal(1))
 
-		// /comm is 0711 so root may traverse it; the directory itself is 0700 and owned by the mount.
+		// /comm and the mount's directories above its credentials are 0711, so root may traverse them; the credential directory is 0700 and owned by the mount.
 		ginkgo.By("Confirming the mounter can reach the credential directory")
-		mode, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("stat -c '%%a' /comm/%s", pvName))
-		framework.ExpectNoError(err, "the mounter should be able to stat the credential directory via 0711 /comm: %s", stderr)
+		mode, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("stat -c '%%a' /comm/mounts/%s/credentials", pvName))
+		framework.ExpectNoError(err, "the mounter should be able to stat the credential directory via the 0711 directories above it: %s", stderr)
 		gomega.Expect(strings.TrimSpace(mode)).To(gomega.Equal(expectedCredDirMode))
 
-		out, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("ls -A /comm/%s", pvName))
+		out, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("ls -A /comm/mounts/%s/credentials", pvName))
 		if dacOverride {
 			ginkgo.By("Confirming the mounter, which holds CAP_DAC_OVERRIDE, can list the credential directory")
 			framework.ExpectNoError(err, "the mounter holds CAP_DAC_OVERRIDE, so it should be able to list %s: %s", pvName, stderr)
