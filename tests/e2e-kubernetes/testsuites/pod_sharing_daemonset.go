@@ -688,7 +688,7 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 			// Verify .meta.json file exists on the node by exec'ing into CSI node pod
 			pvName := resource.Pv.Name
 			ginkgo.By(fmt.Sprintf("Verifying .meta.json exists for volume %s", pvName))
-			metaExists := checkMetaFileExists(ctx, f, targetNode, pvName)
+			metaExists := checkMetaFileExists(ctx, f, targetNode, string(resource.Pv.UID))
 			gomega.Expect(metaExists).To(gomega.BeTrue(),
 				"expected .meta.json file to exist for volume %s", pvName)
 		})
@@ -699,11 +699,12 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 
 			targetNode, pods := createPodsOnSameNode(ctx, f, 1, resource)
 			pvName := resource.Pv.Name
+			pvUID := string(resource.Pv.UID)
 			bucketName := resource.Pv.Spec.CSI.VolumeHandle
 
 			// Meta file should exist while pod is running
 			ginkgo.By("Verifying meta file exists while pod is mounted")
-			metaExists := checkMetaFileExists(ctx, f, targetNode, pvName)
+			metaExists := checkMetaFileExists(ctx, f, targetNode, pvUID)
 			gomega.Expect(metaExists).To(gomega.BeTrue())
 
 			// Credential directory should exist while pod is mounted
@@ -734,7 +735,7 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 			// Give a moment for unmount to complete
 			time.Sleep(5 * time.Second)
 
-			metaExists = checkMetaFileExists(ctx, f, targetNode, pvName)
+			metaExists = checkMetaFileExists(ctx, f, targetNode, pvUID)
 			gomega.Expect(metaExists).To(gomega.BeFalse(),
 				"expected .meta.json file to be removed after last consumer unmounts")
 
@@ -780,7 +781,7 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 			fuseDeviceBefore := getFuseSourceDeviceID(ctx, f, targetNode, pvName)
 			framework.Logf("FUSE device ID before crash: %s", fuseDeviceBefore)
 			gomega.Expect(fuseDeviceBefore).ToNot(gomega.BeEmpty(), "FUSE source should exist before crash")
-			metaMtimeBefore := getMetaFileMtime(ctx, f, targetNode, pvName)
+			metaMtimeBefore := getMetaFileMtime(ctx, f, targetNode, string(resource.Pv.UID))
 			framework.Logf("Meta mtime before crash: %s", metaMtimeBefore)
 
 			// Kill the mounter pod — all FUSE mounts die
@@ -862,7 +863,7 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 
 			// Verify meta file was overwritten (mtime changed)
 			ginkgo.By("Verifying meta file was overwritten after recovery")
-			metaMtimeAfter := getMetaFileMtime(ctx, f, targetNode, pvName)
+			metaMtimeAfter := getMetaFileMtime(ctx, f, targetNode, string(resource.Pv.UID))
 			framework.Logf("Meta mtime — before: %s, after: %s", metaMtimeBefore, metaMtimeAfter)
 			gomega.Expect(metaMtimeAfter).ToNot(gomega.Equal(metaMtimeBefore),
 				"meta file mtime should change after fresh mount overwrites it")
@@ -1154,10 +1155,10 @@ func isPodReady(pod *v1.Pod) bool {
 }
 
 // checkMetaFileExists execs into the CSI node pod and checks if the .meta.json file
-// exists for the given volume ID.
+// exists for the PV whose UID is pvUID.
 // Retries on transient exec errors (container restarting, etc.) for up to 1 minute.
 // Only retries when exec fails; if exec succeeds and file is MISSING, that's a real result.
-func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, volumeID string) bool {
+func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, pvUID string) bool {
 	var result bool
 	gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
 		pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
@@ -1170,7 +1171,7 @@ func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", pvUID)
 		cmd := fmt.Sprintf("test -f %s && echo EXISTS || echo MISSING", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1180,7 +1181,7 @@ func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		output := strings.TrimSpace(stdout)
-		framework.Logf("Meta file check for %s on node %s: %s", volumeID, nodeName, output)
+		framework.Logf("Meta file check for %s on node %s: %s", pvUID, nodeName, output)
 		result = output == "EXISTS"
 		return output, nil
 	}).WithTimeout(1 * time.Minute).WithPolling(5 * time.Second).ShouldNot(gomega.BeEmpty())
@@ -1241,10 +1242,10 @@ func assertPodIOFails(ctx context.Context, f *framework.Framework, pod *v1.Pod, 
 		"expected I/O failure after mounter crash, got: %s", combinedOutput)
 }
 
-// readMetaFileContent reads the .meta.json file content for a given volume from the CSI node pod.
+// readMetaFileContent reads the .meta.json file content of the PV whose UID is pvUID from the CSI node pod.
 // Returns the raw JSON string, or empty string if the file doesn't exist.
 // Retries on transient exec errors for up to 30 seconds.
-func readMetaFileContent(ctx context.Context, f *framework.Framework, nodeName, volumeID string) string {
+func readMetaFileContent(ctx context.Context, f *framework.Framework, nodeName, pvUID string) string {
 	var result string
 	gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
 		pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
@@ -1257,7 +1258,7 @@ func readMetaFileContent(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", pvUID)
 		cmd := fmt.Sprintf("cat %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1305,10 +1306,10 @@ func checkDeviceIDAtSourcePath(ctx context.Context, f *framework.Framework, node
 	return result
 }
 
-// getMetaFileMtime returns the modification time of the .meta.json file for the given volume.
+// getMetaFileMtime returns the modification time of the .meta.json file of the PV whose UID is pvUID.
 // Uses stat to get the mtime. Returns empty string if file doesn't exist.
 // Retries on transient exec errors for up to 30 seconds.
-func getMetaFileMtime(ctx context.Context, f *framework.Framework, nodeName, volumeID string) string {
+func getMetaFileMtime(ctx context.Context, f *framework.Framework, nodeName, pvUID string) string {
 	var result string
 	gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
 		pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
@@ -1320,7 +1321,7 @@ func getMetaFileMtime(ctx context.Context, f *framework.Framework, nodeName, vol
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", pvUID)
 		cmd := fmt.Sprintf("stat -c '%%Y' %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})

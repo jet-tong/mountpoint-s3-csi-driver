@@ -11,11 +11,11 @@ import (
 	mountutils "k8s.io/mount-utils"
 )
 
-// MetaFileName returns the path to the .meta.json file for a given volume.
+// MetaFileName returns the path to the .meta.json file of the PV whose metadata.uid is pvUID.
 // Meta files live in a dedicated directory separate from FUSE source mounts to avoid
 // collisions with PV names that could end in ".meta.json".
-func MetaFileName(kubeletPath, volumeID string) string {
-	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", volumeID+".meta.json")
+func MetaFileName(kubeletPath, pvUID string) string {
+	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", pvUID+".meta.json")
 }
 
 // MountMeta is the JSON-serializable structure persisted alongside each source mount.
@@ -23,6 +23,7 @@ func MetaFileName(kubeletPath, volumeID string) string {
 // and for subsequent share requests after driver restart.
 type MountMeta struct {
 	VolumeID                 string   `json:"volumeID"`
+	PVUID                    string   `json:"pvUID"`
 	CommDir                  string   `json:"commDir"`
 	MountOptions             []string `json:"mountOptions"`
 	AuthenticationSource     string   `json:"authenticationSource"`
@@ -39,6 +40,7 @@ type MountMeta struct {
 func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	meta := MountMeta{
 		VolumeID:                 entry.VolumeID,
+		PVUID:                    entry.PVUID,
 		CommDir:                  entry.CommDir,
 		MountOptions:             entry.Params.MountOptions,
 		AuthenticationSource:     entry.Params.AuthenticationSource,
@@ -55,7 +57,7 @@ func WriteMeta(kubeletPath string, entry *MountEntry) error {
 		return fmt.Errorf("failed to marshal mount meta for volume %s: %w", entry.VolumeID, err)
 	}
 
-	metaPath := MetaFileName(kubeletPath, entry.VolumeID)
+	metaPath := MetaFileName(kubeletPath, entry.PVUID)
 	if err := os.MkdirAll(filepath.Dir(metaPath), 0750); err != nil {
 		return fmt.Errorf("failed to create meta directory: %w", err)
 	}
@@ -74,9 +76,9 @@ func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	return nil
 }
 
-// RemoveMeta removes the volume's .meta.json, treating an already-absent file as success.
-func RemoveMeta(kubeletPath, volumeID string) error {
-	return removeMetaFile(MetaFileName(kubeletPath, volumeID))
+// RemoveMeta removes the .meta.json of the PV whose UID is pvUID, treating an already-absent file as success.
+func RemoveMeta(kubeletPath, pvUID string) error {
+	return removeMetaFile(MetaFileName(kubeletPath, pvUID))
 }
 
 // removeMetaFile removes the meta file at `metaPath`, treating an already-absent file as success.
@@ -87,7 +89,7 @@ func removeMetaFile(metaPath string) error {
 	return nil
 }
 
-// readMeta reads and parses a .meta.json file.
+// readMeta reads and parses a .meta.json file, rejecting one not named after the PV UID it records.
 func readMeta(path string) (*MountMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -96,6 +98,10 @@ func readMeta(path string) (*MountMeta, error) {
 	var meta MountMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal %s: %w", path, err)
+	}
+	// Cleanup goes by the recorded UID, so a file named otherwise could send another PV's files to it.
+	if meta.PVUID == "" || filepath.Base(path) != meta.PVUID+".meta.json" {
+		return nil, fmt.Errorf("its name does not match the PV UID %q it records", meta.PVUID)
 	}
 	return &meta, nil
 }

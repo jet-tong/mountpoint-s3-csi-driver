@@ -247,6 +247,7 @@ func (dm *DaemonsetMounter) SetS3PACache(cache client.Reader) {
 //     already bound to this source would have a dead target too and stopped at step 1.
 //     - Healthy source → validate compatibility (reject incompatible params before any cred writes)
 //  4. If source not mounted (fresh, dead-source recovery, or prior failed attempt):
+//     - Get the PV's UID from the API server unless the entry holds it; fail mount if that fails
 //     - Clean up any stale resources via cleanupMount (idempotent); fail mount if cleanup fails
 //     - Claim a UID from the allocator unless the entry already holds one
 //     - Write meta file (the durable record of that UID), set SourcePath/CommDir on the entry
@@ -411,7 +412,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 	}
 
 	if !entry.sourceMounted {
-		if err := dm.prepareFreshMount(entry, volumeID, mounter.commDir, incomingParams, credentialCtx); err != nil {
+		if err := dm.prepareFreshMount(ctx, entry, volumeID, mounter.commDir, incomingParams, credentialCtx); err != nil {
 			return err
 		}
 	}
@@ -520,10 +521,19 @@ func (dm *DaemonsetMounter) resolveExistingSource(ctx context.Context, entry *Mo
 	}
 }
 
-// prepareFreshMount gives the entry everything a mount needs before one is made: a clean slate, the
-// volume's handle, its paths, a UID, and a meta file recording them. Caller must hold entry.mu.
-func (dm *DaemonsetMounter) prepareFreshMount(entry *MountEntry, volumeID, commDir string,
+// prepareFreshMount gives the entry everything a mount needs before one is made: its PV's UID, a clean
+// slate, the volume's handle, its paths, a UID, and a meta file recording them. Caller must hold entry.mu.
+func (dm *DaemonsetMounter) prepareFreshMount(ctx context.Context, entry *MountEntry, volumeID, commDir string,
 	incomingParams MountParams, credentialCtx credentialprovider.ProvideContext) error {
+
+	// An entry from an earlier attempt or a meta file keeps the PV UID its files are named after.
+	if entry.PVUID == "" {
+		pv, err := dm.clientset.CoreV1().PersistentVolumes().Get(ctx, volumeID, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get PersistentVolume %s: %w", volumeID, err)
+		}
+		entry.PVUID = string(pv.UID)
+	}
 
 	// Set before the cleanup below so that it covers the credential directory. This prevents one left
 	// by an earlier mount from being adopted instead of discarded.
@@ -866,7 +876,7 @@ func (dm *DaemonsetMounter) teardownEntry(volumeID string, entry *MountEntry,
 // failed removal keeps both the UID and the entry, so the periodic cleanup retries. Caller must hold
 // entry.mu.
 func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
-	if err := RemoveMeta(dm.kubeletPath, volumeID); err != nil {
+	if err := RemoveMeta(dm.kubeletPath, entry.PVUID); err != nil {
 		klog.Errorf("DaemonsetMounter: %v for volume %s, keeping in-memory tracking (will retry next cleanup)",
 			err, volumeID)
 		return
@@ -1437,6 +1447,7 @@ func (dm *DaemonsetMounter) populateEntryFromMeta(meta *MountMeta, sourcePath st
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	entry.SourcePath = sourcePath
+	entry.PVUID = meta.PVUID
 	entry.CommDir = meta.CommDir
 	entry.Uid = meta.Uid
 	entry.Params = MountParams{

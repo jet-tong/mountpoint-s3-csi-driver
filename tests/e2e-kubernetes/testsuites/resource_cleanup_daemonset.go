@@ -258,6 +258,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 		resource := createVolumeResourceWithMountOptions(ctx, l.config, pattern, nil)
 		l.resources = append(l.resources, resource)
 		pvName := resource.Pv.Name
+		pvUID := string(resource.Pv.UID)
 		bucketName := resource.Pv.Spec.CSI.VolumeAttributes["bucketName"]
 
 		ginkgo.By("Creating a workload without waiting for it to start")
@@ -326,7 +327,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 		// Fails if the retry re-used a directory chowned to the interrupted attempt's UID while Mountpoint
 		// runs as another, as Mountpoint could then not read its credentials.
 		mountpointProcessRunningAs(ctx, f, targetNode, credDir.uid)
-		gomega.Expect(checkMetaFileExists(ctx, f, targetNode, pvName)).To(gomega.BeTrue(),
+		gomega.Expect(checkMetaFileExists(ctx, f, targetNode, pvUID)).To(gomega.BeTrue(),
 			"the retried publish must persist the mount's metadata for volume %s", pvName)
 
 		ginkgo.By("Deleting the workload and checking the unpublish removes every trace of the mount")
@@ -340,7 +341,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 		}).WithTimeout(time.Minute).WithPolling(5*time.Second).Should(gomega.Equal(0),
 			"the Mountpoint for bucket %s must exit", bucketName)
 		gomega.Eventually(ctx, func(ctx context.Context) bool {
-			return checkMetaFileExists(ctx, f, targetNode, pvName)
+			return checkMetaFileExists(ctx, f, targetNode, pvUID)
 		}).WithTimeout(time.Minute).WithPolling(5*time.Second).Should(gomega.BeFalse(),
 			"the metadata for volume %s must be removed", pvName)
 		checkCredentialDirRemoved(ctx, f, targetNode, pvName)

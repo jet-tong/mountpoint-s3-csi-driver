@@ -98,6 +98,10 @@ type MountEntry struct {
 	// error file name, and mount identifier when communicating with the secondary daemonset.
 	VolumeID string
 
+	// PVUID is the PV's metadata.uid, which names the mount's meta file: a PV name can take 253 of
+	// the 255 bytes a file name may have.
+	PVUID string
+
 	// CommDir is the comm directory path at the time this mount was created.
 	// Cleanup uses this to ensure resources are cleaned in the same location where they were
 	// provisioned, avoiding mismatches if the mounter pod restarts between mount and unmount.

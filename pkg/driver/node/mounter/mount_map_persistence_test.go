@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -71,6 +72,7 @@ func TestWriteMeta_CreatesFile(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-abc123",
+		PVUID:      "vol-abc123-uid",
 		SourcePath: filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "mnt", "vol-abc123"),
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other", "--region=us-east-1"},
@@ -88,7 +90,7 @@ func TestWriteMeta_CreatesFile(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify file exists at expected path
-	metaPath := MetaFileName(kubeletPath, "vol-abc123")
+	metaPath := MetaFileName(kubeletPath, entry.PVUID)
 	_, err = os.Stat(metaPath)
 	assert.NoError(t, err)
 
@@ -101,6 +103,7 @@ func TestWriteMeta_CreatesFile(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equals(t, "vol-abc123", meta.VolumeID)
+	assert.Equals(t, "vol-abc123-uid", meta.PVUID)
 	assert.Equals(t, "driver", meta.AuthenticationSource)
 	assert.Equals(t, "default", meta.ServiceAccountName)
 	assert.Equals(t, "arn:aws:iam::111111111111:role/my-role", meta.ServiceAccountEKSRoleARN)
@@ -116,6 +119,7 @@ func TestWriteMeta_OverwritesExisting(t *testing.T) {
 
 	entry1 := &MountEntry{
 		VolumeID:   "vol-overwrite",
+		PVUID:      "vol-overwrite-uid",
 		SourcePath: "/source-1",
 		Params:     MountParams{ServiceAccountName: "sa-first"},
 	}
@@ -124,13 +128,14 @@ func TestWriteMeta_OverwritesExisting(t *testing.T) {
 
 	entry2 := &MountEntry{
 		VolumeID:   "vol-overwrite",
+		PVUID:      "vol-overwrite-uid",
 		SourcePath: "/source-2",
 		Params:     MountParams{ServiceAccountName: "sa-second"},
 	}
 	err = WriteMeta(kubeletPath, entry2)
 	assert.NoError(t, err)
 
-	meta, err := readMeta(MetaFileName(kubeletPath, "vol-overwrite"))
+	meta, err := readMeta(MetaFileName(kubeletPath, "vol-overwrite-uid"))
 	assert.NoError(t, err)
 	assert.Equals(t, "sa-second", meta.ServiceAccountName)
 }
@@ -159,15 +164,15 @@ func TestWriteMeta_CreatesDirectoryIfMissing(t *testing.T) {
 func TestRemoveMeta_RemovesFile(t *testing.T) {
 	kubeletPath := t.TempDir()
 
-	entry := &MountEntry{VolumeID: "vol-remove", SourcePath: "/source"}
+	entry := &MountEntry{VolumeID: "vol-remove", PVUID: "vol-remove-uid", SourcePath: "/source"}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
-	metaPath := MetaFileName(kubeletPath, "vol-remove")
+	metaPath := MetaFileName(kubeletPath, entry.PVUID)
 	_, err = os.Stat(metaPath)
 	assert.NoError(t, err)
 
-	assert.NoError(t, RemoveMeta(kubeletPath, "vol-remove"))
+	assert.NoError(t, RemoveMeta(kubeletPath, entry.PVUID))
 
 	_, err = os.Stat(metaPath)
 	if !os.IsNotExist(err) {
@@ -185,6 +190,7 @@ func TestReadMeta_ParsesCorrectly(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-read",
+		PVUID:      "vol-read-uid",
 		SourcePath: "/my/source/path",
 		Params: MountParams{
 			MountOptions:             []string{"--read-only"},
@@ -198,7 +204,7 @@ func TestReadMeta_ParsesCorrectly(t *testing.T) {
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
-	meta, err := readMeta(MetaFileName(kubeletPath, "vol-read"))
+	meta, err := readMeta(MetaFileName(kubeletPath, entry.PVUID))
 	assert.NoError(t, err)
 
 	assert.Equals(t, "vol-read", meta.VolumeID)
@@ -235,8 +241,8 @@ func TestReadMeta_FileNotFound(t *testing.T) {
 }
 
 func TestMetaFileName_Format(t *testing.T) {
-	path := MetaFileName("/var/lib/kubelet", "vol-test-123")
-	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/vol-test-123.meta.json"
+	path := MetaFileName("/var/lib/kubelet", "0f8fad5b-d9cb-469f-a165-70867728950e")
+	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/0f8fad5b-d9cb-469f-a165-70867728950e.meta.json"
 	assert.Equals(t, expected, path)
 }
 
@@ -245,12 +251,13 @@ func TestWriteMeta_EmptyMountOptions(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID: "vol-empty-opts",
+		PVUID:    "vol-empty-opts-uid",
 		Params:   MountParams{MountOptions: nil, AuthenticationSource: "driver"},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
-	meta, err := readMeta(MetaFileName(kubeletPath, "vol-empty-opts"))
+	meta, err := readMeta(MetaFileName(kubeletPath, entry.PVUID))
 	assert.NoError(t, err)
 	if meta.MountOptions != nil {
 		t.Fatalf("expected nil mount options, got: %v", meta.MountOptions)
@@ -262,12 +269,13 @@ func TestWriteMeta_EmptyEKSRoleARN_PresentInJSON(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID: "vol-no-arn",
+		PVUID:    "vol-no-arn-uid",
 		Params:   MountParams{AuthenticationSource: "driver", ServiceAccountEKSRoleARN: ""},
 	}
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
-	data, err := os.ReadFile(MetaFileName(kubeletPath, "vol-no-arn"))
+	data, err := os.ReadFile(MetaFileName(kubeletPath, entry.PVUID))
 	assert.NoError(t, err)
 
 	var raw map[string]interface{}
@@ -277,7 +285,7 @@ func TestWriteMeta_EmptyEKSRoleARN_PresentInJSON(t *testing.T) {
 		t.Fatal("expected serviceAccountEKSRoleARN to be present in JSON even when empty")
 	}
 
-	meta, err := readMeta(MetaFileName(kubeletPath, "vol-no-arn"))
+	meta, err := readMeta(MetaFileName(kubeletPath, entry.PVUID))
 	assert.NoError(t, err)
 	assert.Equals(t, "", meta.ServiceAccountEKSRoleARN)
 }
@@ -402,12 +410,43 @@ func TestRebuildMountMap_FailsOnInvalidMetaJSON(t *testing.T) {
 	}
 }
 
+func TestRebuildMountMap_FailsOnMetaNotNamedAfterItsPVUID(t *testing.T) {
+	for _, testCase := range []struct {
+		name, fileName, pvUID string
+	}{
+		{"recording another PV's UID", "pv-a-uid.meta.json", "pv-b-uid"},
+		{"recording no PV UID", ".meta.json", ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			kubeletPath := t.TempDir()
+			metaDir := filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta")
+			assert.NoError(t, os.MkdirAll(metaDir, 0750))
+			metaPath := filepath.Join(metaDir, testCase.fileName)
+			meta := fmt.Sprintf(`{"volumeID":"pv-a","pvUID":%q,"volumeHandle":"handle-a"}`, testCase.pvUID)
+			assert.NoError(t, os.WriteFile(metaPath, []byte(meta), 0600))
+
+			// The source is live, so nothing but the name stops the mount being recovered.
+			dm := newTestDMWithMountInfo(kubeletPath, fakeMountInfoProvider([]mountutils.MountInfo{
+				{MountPoint: SourceMountPath(kubeletPath, "pv-a"), Major: 0, Minor: 42},
+			}))
+			err := dm.RebuildMountMap()
+
+			if err == nil {
+				t.Fatal("expected RebuildMountMap to fail on a meta file not named after the PV UID it records")
+			}
+			assert.Contains(t, err.Error(), metaPath)
+			assert.Equals(t, true, dm.mountMap.Get("pv-a") == nil)
+		})
+	}
+}
+
 func TestRebuildMountMap_CleansUpDeadSourceMounts(t *testing.T) {
 	kubeletPath := t.TempDir()
 	sourcePath := SourceMountPath(kubeletPath, "vol-dead")
 
 	entry := &MountEntry{
 		VolumeID:   "vol-dead",
+		PVUID:      "vol-dead-uid",
 		SourcePath: sourcePath,
 		Params:     MountParams{AuthenticationSource: "driver", ServiceAccountName: "default"},
 	}
@@ -427,7 +466,7 @@ func TestRebuildMountMap_CleansUpDeadSourceMounts(t *testing.T) {
 	}
 
 	// Meta file should be cleaned up
-	_, err = os.Stat(MetaFileName(kubeletPath, "vol-dead"))
+	_, err = os.Stat(MetaFileName(kubeletPath, entry.PVUID))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected meta file to be removed for dead source")
 	}
@@ -443,6 +482,7 @@ func TestRebuildMountMap_RestoresUIDs(t *testing.T) {
 
 		err := WriteMeta(kubeletPath, &MountEntry{
 			VolumeID:   "vol-live",
+			PVUID:      "vol-live-uid",
 			SourcePath: sourcePath,
 			Params:     MountParams{VolumeHandle: "vol-live-handle"},
 			Uid:        recoveredUID,
@@ -468,6 +508,7 @@ func TestRebuildMountMap_RestoresUIDs(t *testing.T) {
 
 		err := WriteMeta(kubeletPath, &MountEntry{
 			VolumeID:   "vol-dead",
+			PVUID:      "vol-dead-uid",
 			SourcePath: SourceMountPath(kubeletPath, "vol-dead"),
 			Uid:        deadUID,
 		})
@@ -489,6 +530,7 @@ func TestRebuildMountMap_RestoresUIDs(t *testing.T) {
 		const unrecordedUID = uint32(0)
 		err := WriteMeta(kubeletPath, &MountEntry{
 			VolumeID:   "vol-legacy",
+			PVUID:      "vol-legacy-uid",
 			SourcePath: sourcePath,
 			Params:     MountParams{VolumeHandle: "vol-legacy-handle"},
 		})
@@ -516,6 +558,7 @@ func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-live",
+		PVUID:      "vol-live-uid",
 		SourcePath: sourcePath,
 		CommDir:    commDir,
 		Params: MountParams{
@@ -548,6 +591,7 @@ func TestRebuildMountMap_RecoversLiveSourceWithBindMounts(t *testing.T) {
 	}
 
 	assert.Equals(t, sourcePath, recovered.SourcePath)
+	assert.Equals(t, entry.PVUID, recovered.PVUID)
 	assert.Equals(t, commDir, recovered.CommDir)
 	assert.Equals(t, 3, recovered.RefCount)
 	assert.Equals(t, 3, len(recovered.Targets))
@@ -569,6 +613,7 @@ func TestRebuildMountMap_ReclaimsVolumeHandle(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "pv-live",
+		PVUID:      "pv-live-uid",
 		SourcePath: sourcePath,
 		Params:     MountParams{AuthenticationSource: "driver", VolumeHandle: "handle-1"},
 	}
@@ -602,6 +647,7 @@ func TestRebuildMountMap_ErrorsOnMissingHandle(t *testing.T) {
 	// required PV field, so this is a corrupt/incomplete meta — rebuild must fail loud.
 	entry := &MountEntry{
 		VolumeID:   "pv-nohandle",
+		PVUID:      "pv-nohandle-uid",
 		SourcePath: sourcePath,
 		Params:     MountParams{AuthenticationSource: "driver"},
 	}
@@ -626,11 +672,13 @@ func TestRebuildMountMap_ErrorsOnHandleConflict(t *testing.T) {
 	// Two recovered volumes claiming the same handle should never happen — fail the rebuild.
 	assert.NoError(t, WriteMeta(kubeletPath, &MountEntry{
 		VolumeID:   "pv-a",
+		PVUID:      "pv-a-uid",
 		SourcePath: sourceA,
 		Params:     MountParams{AuthenticationSource: "driver", VolumeHandle: "dup-handle"},
 	}))
 	assert.NoError(t, WriteMeta(kubeletPath, &MountEntry{
 		VolumeID:   "pv-b",
+		PVUID:      "pv-b-uid",
 		SourcePath: sourceB,
 		Params:     MountParams{AuthenticationSource: "driver", VolumeHandle: "dup-handle"},
 	}))
@@ -653,6 +701,7 @@ func TestRebuildMountMap_SourceWithNoBindMounts(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-orphan",
+		PVUID:      "vol-orphan-uid",
 		SourcePath: sourcePath,
 		Params:     MountParams{AuthenticationSource: "driver", VolumeHandle: "handle-orphan"},
 	}
@@ -684,11 +733,13 @@ func TestRebuildMountMap_MultipleVolumes(t *testing.T) {
 
 	entryA := &MountEntry{
 		VolumeID:   "vol-a",
+		PVUID:      "vol-a-uid",
 		SourcePath: sourceA,
 		Params:     MountParams{ServiceAccountName: "sa-a", VolumeHandle: "handle-a"},
 	}
 	entryB := &MountEntry{
 		VolumeID:   "vol-b",
+		PVUID:      "vol-b-uid",
 		SourcePath: sourceB,
 		Params:     MountParams{ServiceAccountName: "sa-b", VolumeHandle: "handle-b"},
 	}
@@ -725,6 +776,7 @@ func TestWriteReadMetaCycle(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-roundtrip",
+		PVUID:      "vol-roundtrip-uid",
 		SourcePath: SourceMountPath(kubeletPath, "vol-roundtrip"),
 		Params: MountParams{
 			MountOptions:             []string{"--allow-other", "--prefix=data/", "--read-only"},
@@ -738,10 +790,11 @@ func TestWriteReadMetaCycle(t *testing.T) {
 	err := WriteMeta(kubeletPath, entry)
 	assert.NoError(t, err)
 
-	meta, err := readMeta(MetaFileName(kubeletPath, "vol-roundtrip"))
+	meta, err := readMeta(MetaFileName(kubeletPath, entry.PVUID))
 	assert.NoError(t, err)
 
 	assert.Equals(t, entry.VolumeID, meta.VolumeID)
+	assert.Equals(t, entry.PVUID, meta.PVUID)
 	assert.Equals(t, entry.Params.AuthenticationSource, meta.AuthenticationSource)
 	assert.Equals(t, entry.Params.ServiceAccountName, meta.ServiceAccountName)
 	assert.Equals(t, entry.Params.ServiceAccountEKSRoleARN, meta.ServiceAccountEKSRoleARN)
@@ -753,24 +806,48 @@ func TestWriteReadMetaCycle(t *testing.T) {
 	}
 }
 
+func TestWriteRebuildAndRemoveMeta_253BytePVName(t *testing.T) {
+	kubeletPath := t.TempDir()
+	// The longest PV name, a DNS subdomain of 253 bytes, leaves no room for a suffix in a 255-byte file name.
+	pvName := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	sourcePath := SourceMountPath(kubeletPath, pvName)
+	entry := &MountEntry{VolumeID: pvName, PVUID: "3fa85f64-5717-4562-b3fc-2c963f66afa6", SourcePath: sourcePath,
+		Params: MountParams{VolumeHandle: "handle-long"}}
+	assert.NoError(t, WriteMeta(kubeletPath, entry))
+
+	dm := newTestDMWithMountInfo(kubeletPath, fakeMountInfoProvider([]mountutils.MountInfo{
+		{MountPoint: sourcePath, Major: 0, Minor: 42},
+	}))
+	assert.NoError(t, dm.RebuildMountMap())
+	recovered := dm.mountMap.Get(pvName)
+	if recovered == nil {
+		t.Fatal("expected the mount to be recovered from its meta file")
+	}
+
+	dm.forgetMount(pvName, recovered)
+	left, err := os.ReadDir(filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta"))
+	assert.NoError(t, err)
+	assert.Equals(t, 0, len(left))
+}
+
 func TestRemoveMeta_OnlyRemovesTargetVolume(t *testing.T) {
 	kubeletPath := t.TempDir()
 
 	for _, volID := range []string{"vol-keep", "vol-remove", "vol-also-keep"} {
-		entry := &MountEntry{VolumeID: volID, SourcePath: "/source/" + volID}
+		entry := &MountEntry{VolumeID: volID, PVUID: volID + "-uid", SourcePath: "/source/" + volID}
 		err := WriteMeta(kubeletPath, entry)
 		assert.NoError(t, err)
 	}
 
-	assert.NoError(t, RemoveMeta(kubeletPath, "vol-remove"))
+	assert.NoError(t, RemoveMeta(kubeletPath, "vol-remove-uid"))
 
-	_, err := os.Stat(MetaFileName(kubeletPath, "vol-remove"))
+	_, err := os.Stat(MetaFileName(kubeletPath, "vol-remove-uid"))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected vol-remove meta to be deleted")
 	}
-	_, err = os.Stat(MetaFileName(kubeletPath, "vol-keep"))
+	_, err = os.Stat(MetaFileName(kubeletPath, "vol-keep-uid"))
 	assert.NoError(t, err)
-	_, err = os.Stat(MetaFileName(kubeletPath, "vol-also-keep"))
+	_, err = os.Stat(MetaFileName(kubeletPath, "vol-also-keep-uid"))
 	assert.NoError(t, err)
 }
 
@@ -780,11 +857,12 @@ func TestForgetMount_KeepsEntryWhenMetaRemovalFails(t *testing.T) {
 
 	volumeID := "pv-1"
 	entry, _ := dm.mountMap.GetOrCreate(volumeID)
+	entry.PVUID = "pv-1-uid"
 	entry.Params.VolumeHandle = "handle-1"
 	assert.NoError(t, dm.mountMap.ClaimHandle("handle-1", volumeID))
 
 	// Make RemoveMeta fail: a non-empty directory where the .meta.json would be.
-	metaPath := MetaFileName(kubeletPath, volumeID)
+	metaPath := MetaFileName(kubeletPath, entry.PVUID)
 	assert.NoError(t, os.MkdirAll(filepath.Join(metaPath, "blocker"), 0750))
 
 	dm.forgetMount(volumeID, entry)
@@ -814,6 +892,7 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 
 	entry := &MountEntry{
 		VolumeID:   "vol-dead-creds",
+		PVUID:      "vol-dead-creds-uid",
 		SourcePath: SourceMountPath(kubeletPath, "vol-dead-creds"),
 		CommDir:    commDir,
 		Params:     MountParams{AuthenticationSource: "driver"},
@@ -839,15 +918,16 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	}
 
 	// Meta file should be cleaned up
-	_, err = os.Stat(MetaFileName(kubeletPath, "vol-dead-creds"))
+	_, err = os.Stat(MetaFileName(kubeletPath, entry.PVUID))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected meta file to be removed for dead source")
 	}
 }
 
 // seedEntry inserts a source-mounted entry into the map. i.e pretend a mount already exists
-func seedEntry(dm *DaemonsetMounter, volumeID, sourcePath, commDir string, targets []string) *MountEntry {
+func seedEntry(dm *DaemonsetMounter, volumeID, pvUID, sourcePath, commDir string, targets []string) *MountEntry {
 	entry, _ := dm.mountMap.GetOrCreate(volumeID)
+	entry.PVUID = pvUID
 	entry.SourcePath = sourcePath
 	entry.CommDir = commDir
 	entry.Params = MountParams{AuthenticationSource: "driver"}
@@ -873,7 +953,7 @@ func statErr(path string) error {
 
 // TestCleanupOrphans covers the periodic cleanup job's per-entry reconcile logic.
 func TestCleanupOrphans(t *testing.T) {
-	const volumeID = "vol-1"
+	const volumeID, pvUID = "vol-1", "vol-1-uid"
 
 	tests := []struct {
 		name string
@@ -896,7 +976,7 @@ func TestCleanupOrphans(t *testing.T) {
 				commDir := filepath.Join(kubeletPath, "comm")
 				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, volumeID), 0750))
 				os.WriteFile(filepath.Join(commDir, volumeID+".error"), []byte("boom"), 0600)
-				entry := seedEntry(dm, volumeID, sourcePath, commDir, nil)
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, commDir, nil)
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo:       func(_, _ string) []mountutils.MountInfo { return nil },
@@ -912,7 +992,7 @@ func TestCleanupOrphans(t *testing.T) {
 			setup: func(t *testing.T, dm *DaemonsetMounter, fakeMounter *mountutils.FakeMounter, kubeletPath, sourcePath, targetA string) {
 				targetB := filepath.Join(kubeletPath, "pods", "wl-b", "mount")
 				registerSourceMount(t, fakeMounter, sourcePath)
-				entry := seedEntry(dm, volumeID, sourcePath, "", []string{targetA, targetB})
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, "", []string{targetA, targetB})
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo: func(sourcePath, targetA string) []mountutils.MountInfo {
@@ -931,7 +1011,7 @@ func TestCleanupOrphans(t *testing.T) {
 			setup: func(t *testing.T, dm *DaemonsetMounter, fakeMounter *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
 				registerSourceMount(t, fakeMounter, sourcePath)
 				fakeMounter.UnmountFunc = func(string) error { return fmt.Errorf("unmount failed") }
-				entry := seedEntry(dm, volumeID, sourcePath, "", nil) // no live targets -> teardown attempted
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, "", nil) // no live targets -> teardown attempted
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo: func(sourcePath, _ string) []mountutils.MountInfo {
@@ -945,7 +1025,7 @@ func TestCleanupOrphans(t *testing.T) {
 			name: "last consumer gone, torn down",
 			setup: func(t *testing.T, dm *DaemonsetMounter, fakeMounter *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
 				registerSourceMount(t, fakeMounter, sourcePath)
-				entry := seedEntry(dm, volumeID, sourcePath, "", []string{filepath.Join(kubeletPath, "pods", "gone", "mount")})
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, "", []string{filepath.Join(kubeletPath, "pods", "gone", "mount")})
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo: func(sourcePath, _ string) []mountutils.MountInfo {
@@ -959,8 +1039,8 @@ func TestCleanupOrphans(t *testing.T) {
 			// tracking. Cleanup adopts it, so the refcount becomes 1 and the source is kept.
 			name: "untracked live bind mount adopted, not torn down",
 			setup: func(t *testing.T, dm *DaemonsetMounter, fakeMounter *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
-				registerSourceMount(t, fakeMounter, sourcePath)       // source is healthy
-				entry := seedEntry(dm, volumeID, sourcePath, "", nil) // we track no targets
+				registerSourceMount(t, fakeMounter, sourcePath)              // source is healthy
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, "", nil) // we track no targets
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo: func(sourcePath, targetA string) []mountutils.MountInfo {
@@ -981,7 +1061,7 @@ func TestCleanupOrphans(t *testing.T) {
 			name: "dead source with live target torn down",
 			setup: func(t *testing.T, dm *DaemonsetMounter, _ *mountutils.FakeMounter, kubeletPath, sourcePath, targetA string) {
 				// Source is not registered as healthy, so the health probe reports it dead.
-				entry := seedEntry(dm, volumeID, sourcePath, "", []string{targetA})
+				entry := seedEntry(dm, volumeID, pvUID, sourcePath, "", []string{targetA})
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
 			mountInfo: func(sourcePath, targetA string) []mountutils.MountInfo {
@@ -1024,12 +1104,12 @@ func TestCleanupOrphans(t *testing.T) {
 				assert.Equals(t, tt.expectRefCount, entry.RefCount)
 			}
 			if tt.expectMetaGone {
-				assert.Equals(t, true, os.IsNotExist(statErr(MetaFileName(kubeletPath, volumeID))))
+				assert.Equals(t, true, os.IsNotExist(statErr(MetaFileName(kubeletPath, pvUID))))
 			}
 			if tt.expectMetaPresent {
 				// A surviving entry must keep its meta file — RebuildMountMap relies on it
 				// to recover this mount after a CSI node restart.
-				assert.NoError(t, statErr(MetaFileName(kubeletPath, volumeID)))
+				assert.NoError(t, statErr(MetaFileName(kubeletPath, pvUID)))
 			}
 			if tt.expectCommGone {
 				// An orphan's credentials and error file must not outlive it.
@@ -1049,7 +1129,7 @@ func TestCleanupOrphans_MountTableReadError(t *testing.T) {
 		return nil, fmt.Errorf("read mountinfo failed")
 	}
 	dm, _ := newTestDMWithFakeMounter(kubeletPath, failingProvider)
-	seedEntry(dm, "vol-1", SourceMountPath(kubeletPath, "vol-1"), "", nil)
+	seedEntry(dm, "vol-1", "vol-1-uid", SourceMountPath(kubeletPath, "vol-1"), "", nil)
 
 	dm.CleanupOrphans()
 

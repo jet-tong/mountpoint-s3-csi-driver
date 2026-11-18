@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +53,7 @@ type dmTestCtx struct {
 	nodeName      string
 	bucketName    string
 	volumeID      string
+	pvUID         string
 	podUID        string
 	mounterPodUID string
 	kubeletPath   string
@@ -106,6 +108,7 @@ func setupDM(t *testing.T) *dmTestCtx {
 	bucketName := "test-bucket"
 	podUID := uuid.New().String()
 	volumeID := "s3-csi-driver-volume"
+	pvUID := uuid.New().String()
 	nodeName := "test-node"
 	mounterPodUID := uuid.New().String()
 
@@ -134,7 +137,8 @@ func setupDM(t *testing.T) *dmTestCtx {
 			Phase: corev1.PodRunning,
 		},
 	}
-	client := fake.NewSimpleClientset(pod)
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: volumeID, UID: types.UID(pvUID)}}
+	client := fake.NewSimpleClientset(pod, pv)
 	fakeMounter := mountutils.NewFakeMounter(nil)
 
 	testCtx := &dmTestCtx{
@@ -145,6 +149,7 @@ func setupDM(t *testing.T) *dmTestCtx {
 		nodeName:      nodeName,
 		bucketName:    bucketName,
 		volumeID:      volumeID,
+		pvUID:         pvUID,
 		podUID:        podUID,
 		mounterPodUID: mounterPodUID,
 		kubeletPath:   kubeletPath,
@@ -247,6 +252,28 @@ func (testCtx *dmTestCtx) replaceMounterPod() string {
 	commDir := filepath.Join(testCtx.kubeletPath, "pods", string(replacement.UID), "volumes", "kubernetes.io~empty-dir", mounter.CommVolumeName)
 	assert.NoError(testCtx.t, os.MkdirAll(commDir, 0750))
 	return commDir
+}
+
+// apiCalls returns the verb and resource of every request the API server has had since its last ClearActions.
+func (testCtx *dmTestCtx) apiCalls() []string {
+	var calls []string
+	for _, action := range testCtx.client.Actions() {
+		calls = append(calls, action.GetVerb()+" "+action.GetResource().Resource)
+	}
+	return calls
+}
+
+// commDirEntries returns the names in the mounter pod's comm directory.
+func (testCtx *dmTestCtx) commDirEntries() []string {
+	testCtx.t.Helper()
+
+	entries, err := os.ReadDir(testCtx.commDir)
+	assert.NoError(testCtx.t, err)
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 // mountAndServe runs Mount to completion for a workload pod, playing the mounter's part by
@@ -505,6 +532,49 @@ func TestDaemonsetMounter(t *testing.T) {
 			if mountSyscallCalled {
 				t.Error("mountSyscall should not be called for already-mounted target")
 			}
+		})
+
+		t.Run("Asks the API server for the PV only on a fresh mount", func(t *testing.T) {
+			testCtx := setupDM(t)
+			testCtx.client.ClearActions()
+
+			testCtx.mountAndServe(testCtx.podUID, nil)
+			assert.Equals(t, []string{"get persistentvolumes"}, testCtx.apiCalls())
+
+			// A republish, a second pod sharing the mount and unpublishing both reuse the PV UID the mount holds.
+			testCtx.client.ClearActions()
+			for _, podUID := range []string{testCtx.podUID, "pod-b-uid"} {
+				assert.NoError(t, testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath(podUID),
+					testCtx.driverProvideCtx(podUID), nil, mountpoint.ParseArgs(nil), "", nil))
+			}
+			for _, podUID := range []string{testCtx.podUID, "pod-b-uid"} {
+				assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, testCtx.targetPath(podUID),
+					credentialprovider.CleanupContext{VolumeID: testCtx.volumeID, PodID: podUID}))
+			}
+			assert.Equals(t, []string(nil), testCtx.apiCalls())
+		})
+
+		t.Run("Fails without touching the node when the PV is not found", func(t *testing.T) {
+			testCtx := setupDM(t)
+			assert.NoError(t, testCtx.client.CoreV1().PersistentVolumes().Delete(testCtx.ctx, testCtx.volumeID, metav1.DeleteOptions{}))
+			mounted := false
+			testCtx.mountSyscall = func(string, mpmounter.MountOptions) (int, error) {
+				mounted = true
+				return 0, errors.New("a mount whose PV is not found must not get this far")
+			}
+
+			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath(testCtx.podUID),
+				testCtx.driverProvideCtx(testCtx.podUID), nil, mountpoint.ParseArgs(nil), "", nil)
+			if err == nil {
+				t.Fatal("expected the mount to fail when its PV is not found")
+			}
+			assert.Equals(t, true, apierrors.IsNotFound(err))
+			assert.Contains(t, err.Error(), testCtx.volumeID)
+
+			assert.Equals(t, false, mounted)
+			assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
+			assert.FileNotExists(t, filepath.Dir(mounter.MetaFileName(testCtx.kubeletPath, testCtx.pvUID)))
+			assert.Equals(t, []string(nil), testCtx.commDirEntries())
 		})
 
 		t.Run("Credentials cleaned up on mount failure", func(t *testing.T) {
@@ -937,7 +1007,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 
 		// A failure that leaves the map entry behind, so every retry finds a UID already on it.
 		// WriteMeta fails because a file sits where its directory belongs.
-		metaDir := filepath.Dir(mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		metaDir := filepath.Dir(mounter.MetaFileName(testCtx.kubeletPath, testCtx.pvUID))
 		assert.NoError(t, os.MkdirAll(filepath.Dir(metaDir), 0750))
 		assert.NoError(t, os.WriteFile(metaDir, nil, 0600))
 
@@ -972,7 +1042,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, true, err != nil)
 
 		// A mount that never came up keeps nothing: no meta file, and its UID back in the pool.
-		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.pvUID))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
 
@@ -1003,7 +1073,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, true, err != nil)
 
 		// A mount still serving its consumers keeps its records.
-		_, statErr := os.Stat(mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		_, statErr := os.Stat(mounter.MetaFileName(testCtx.kubeletPath, testCtx.pvUID))
 		assert.NoError(t, statErr)
 		assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
@@ -1354,7 +1424,7 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 		err := mountWithoutServing(testCtx, testCtx.ctx, "pod-rejected", cacheRequest)
 		assert.Equals(t, codes.InvalidArgument, status.Code(err))
 
-		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.pvUID))
 		assert.FileNotExists(t, mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
@@ -1770,8 +1840,8 @@ func TestMount_CorruptedTarget_NoMapEntryNoMeta(t *testing.T) {
 	assertDeadTargetMessage(t, status.Convert(err).Message(), volumeID, "team-a/trainer-0 (pod-uid-123)")
 
 	// No meta file should exist — Mount bailed before writing anything.
-	metaPath := mounter.MetaFileName(kubeletPath, volumeID)
-	_, statErr := os.Stat(metaPath)
+	metaDir := filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta")
+	_, statErr := os.Stat(metaDir)
 	assert.Equals(t, true, os.IsNotExist(statErr))
 }
 
@@ -1815,8 +1885,8 @@ func TestMount_AbsentTarget_ProceedsToMount(t *testing.T) {
 
 	// No meta file should exist — Mount errored before reaching WriteMeta because commDir
 	// is not configured in this minimal test setup.
-	metaPath := mounter.MetaFileName(kubeletPath, volumeID)
-	_, statErr := os.Stat(metaPath)
+	metaDir := filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta")
+	_, statErr := os.Stat(metaDir)
 	assert.Equals(t, true, os.IsNotExist(statErr))
 }
 
