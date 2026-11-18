@@ -937,7 +937,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 
 		// A failure that leaves the map entry behind, so every retry finds a UID already on it.
 		// WriteMeta fails because a file sits where its directory belongs.
-		metaDir := filepath.Dir(mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		metaDir := filepath.Dir(mounter.MetaFileName(testCtx.kubeletPath, mounter.UIDRangeStart))
 		assert.NoError(t, os.MkdirAll(filepath.Dir(metaDir), 0750))
 		assert.NoError(t, os.WriteFile(metaDir, nil, 0600))
 
@@ -972,7 +972,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, true, err != nil)
 
 		// A mount that never came up keeps nothing: no meta file, and its UID back in the pool.
-		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, mounter.UIDRangeStart))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
 
@@ -1003,7 +1003,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, true, err != nil)
 
 		// A mount still serving its consumers keeps its records.
-		_, statErr := os.Stat(mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		_, statErr := os.Stat(mounter.MetaFileName(testCtx.kubeletPath, mounter.UIDRangeStart))
 		assert.NoError(t, statErr)
 		assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
@@ -1354,7 +1354,7 @@ func TestDaemonsetMounter_Cache(t *testing.T) {
 		err := mountWithoutServing(testCtx, testCtx.ctx, "pod-rejected", cacheRequest)
 		assert.Equals(t, codes.InvalidArgument, status.Code(err))
 
-		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, testCtx.volumeID))
+		assert.FileNotExists(t, mounter.MetaFileName(testCtx.kubeletPath, mounter.UIDRangeStart))
 		assert.FileNotExists(t, mounter.SourceMountPath(testCtx.kubeletPath, testCtx.volumeID))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 	})
@@ -1770,7 +1770,7 @@ func TestMount_CorruptedTarget_NoMapEntryNoMeta(t *testing.T) {
 	assertDeadTargetMessage(t, status.Convert(err).Message(), volumeID, "team-a/trainer-0 (pod-uid-123)")
 
 	// No meta file should exist — Mount bailed before writing anything.
-	metaPath := mounter.MetaFileName(kubeletPath, volumeID)
+	metaPath := mounter.MetaFileName(kubeletPath, mounter.UIDRangeStart)
 	_, statErr := os.Stat(metaPath)
 	assert.Equals(t, true, os.IsNotExist(statErr))
 }
@@ -1815,7 +1815,7 @@ func TestMount_AbsentTarget_ProceedsToMount(t *testing.T) {
 
 	// No meta file should exist — Mount errored before reaching WriteMeta because commDir
 	// is not configured in this minimal test setup.
-	metaPath := mounter.MetaFileName(kubeletPath, volumeID)
+	metaPath := mounter.MetaFileName(kubeletPath, mounter.UIDRangeStart)
 	_, statErr := os.Stat(metaPath)
 	assert.Equals(t, true, os.IsNotExist(statErr))
 }

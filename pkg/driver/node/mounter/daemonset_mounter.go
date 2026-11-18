@@ -866,7 +866,7 @@ func (dm *DaemonsetMounter) teardownEntry(volumeID string, entry *MountEntry,
 // failed removal keeps both the UID and the entry, so the periodic cleanup retries. Caller must hold
 // entry.mu.
 func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
-	if err := RemoveMeta(dm.kubeletPath, volumeID); err != nil {
+	if err := RemoveMeta(dm.kubeletPath, entry.Uid); err != nil {
 		klog.Errorf("DaemonsetMounter: %v for volume %s, keeping in-memory tracking (will retry next cleanup)",
 			err, volumeID)
 		return
@@ -1510,6 +1510,12 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 			// with no recovery path.
 			return fmt.Errorf("failed to read mount meta %s: %w. "+
 				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, err)
+		}
+
+		// Fail closed here too: RemoveMeta finds a meta file by its UID, and a misnamed one may share its UID with another.
+		if metaPath != MetaFileName(dm.kubeletPath, meta.Uid) {
+			return fmt.Errorf("mount meta %s records UID %d, which does not match its name. "+
+				"Drain this node to move workloads elsewhere, then delete this meta file to allow the node to start", metaPath, meta.Uid)
 		}
 
 		if err := dm.uidAllocator.Reserve(meta.Uid); err != nil {

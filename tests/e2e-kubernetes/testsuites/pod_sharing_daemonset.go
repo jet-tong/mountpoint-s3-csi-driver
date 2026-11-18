@@ -1153,6 +1153,12 @@ func isPodReady(pod *v1.Pod) bool {
 	return false
 }
 
+// metaFileOf is a shell word for the path of the .meta.json file of the given volume ID, or "" if there is none.
+// The file is named after the mount's UID, so it is found by the volume ID it records.
+func metaFileOf(volumeID string) string {
+	return fmt.Sprintf(`"$(grep -l -s -F '"volumeID":"%s"' /var/lib/kubelet/plugins/s3.csi.aws.com/meta/*.meta.json)"`, volumeID)
+}
+
 // checkMetaFileExists execs into the CSI node pod and checks if the .meta.json file
 // exists for the given volume ID.
 // Retries on transient exec errors (container restarting, etc.) for up to 1 minute.
@@ -1170,7 +1176,7 @@ func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("test -f %s && echo EXISTS || echo MISSING", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1257,7 +1263,7 @@ func readMetaFileContent(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("cat %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1320,7 +1326,7 @@ func getMetaFileMtime(ctx context.Context, f *framework.Framework, nodeName, vol
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("stat -c '%%Y' %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
