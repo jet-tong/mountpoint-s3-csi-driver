@@ -254,6 +254,16 @@ func (testCtx *dmTestCtx) replaceMounterPod() string {
 	return commDir
 }
 
+// usePV adds a PV named `name` to the API server and makes it the volume the test mounts.
+func (testCtx *dmTestCtx) usePV(name string) {
+	testCtx.t.Helper()
+
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uuid.New().String())}}
+	_, err := testCtx.client.CoreV1().PersistentVolumes().Create(testCtx.ctx, pv, metav1.CreateOptions{})
+	assert.NoError(testCtx.t, err)
+	testCtx.volumeID, testCtx.pvUID = name, string(pv.UID)
+}
+
 // apiCalls returns the verb and resource of every request the API server has had since its last ClearActions.
 func (testCtx *dmTestCtx) apiCalls() []string {
 	var calls []string
@@ -428,7 +438,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				// the UID below that the process runs as.
 				Args:     []string{"--gid=1000", "--prefix=data/", "--uid=1000", expectedUserAgent},
 				Env:      env.List(),
-				VolumeId: testCtx.volumeID,
+				VolumeId: testCtx.pvUID,
 				// The first mount on a fresh allocator takes the bottom of the range.
 				Uid: mounter.UIDRangeStart,
 				Gid: mounter.UIDRangeStart,
@@ -440,7 +450,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 			// A directory that outlived its map entry, so this mount is the entry's first attempt and has
 			// nothing recorded to clean. Its contents belong to whoever mounted this PV before.
-			credDir := filepath.Join(testCtx.commDir, testCtx.volumeID)
+			credDir := filepath.Join(testCtx.commDir, testCtx.pvUID)
 			assert.NoError(t, os.MkdirAll(credDir, 0700))
 			stale := filepath.Join(credDir, "token")
 			assert.NoError(t, os.WriteFile(stale, []byte("an-earlier-mounts-token"), 0400))
@@ -479,6 +489,29 @@ func TestDaemonsetMounter(t *testing.T) {
 			assert.Equals(t, uint32(mounter.UIDRangeStart), got.Uid)
 		})
 
+		t.Run("Mounts and unmounts a PV with a 253-byte name, leaving nothing in the comm directory", func(t *testing.T) {
+			testCtx := setupDM(t)
+			// The longest PV name, a DNS subdomain of 253 bytes, leaves no room for a suffix in a 255-byte file name.
+			testCtx.usePV(strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61))
+			target := testCtx.targetPath(testCtx.podUID)
+
+			// Plays the mounter in the background, so a Mount that fails before sending reports its own error.
+			served := make(chan struct{})
+			go func() {
+				defer close(served)
+				if got, err := mountoptions.Recv(testCtx.ctx, filepath.Join(testCtx.commDir, mounter.MountSockName)); err == nil {
+					os.NewFile(uintptr(got.Fd), "fuse-fd").Close()
+				}
+			}()
+			assert.NoError(t, testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, target, testCtx.driverProvideCtx(testCtx.podUID),
+				nil, mountpoint.ParseArgs(nil), "", nil))
+			<-served
+
+			assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, target,
+				credentialprovider.CleanupContext{VolumeID: testCtx.volumeID, PodID: testCtx.podUID}))
+			assert.Equals(t, []string(nil), testCtx.commDirEntries())
+		})
+
 		t.Run("Does not duplicate mounts if target is already mounted and refreshes credentials", func(t *testing.T) {
 			mockCtl := gomock.NewController(t)
 			mockCredProvider := mock_credentialprovider.NewMockProviderInterface(mockCtl)
@@ -486,9 +519,9 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx := setupDM(t)
 			target := testCtx.targetPath(testCtx.podUID)
 
-			// volumeID is the PV name extracted from target path — used as credential dir name
-			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.volumeID)
-			expectedEnvPath := filepath.Join("/comm", testCtx.volumeID)
+			// The credential directory is named after the PV's UID.
+			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.pvUID)
+			expectedEnvPath := filepath.Join("/comm", testCtx.pvUID)
 
 			// The fresh mount cleans before it provides, discarding anything an earlier mount left.
 			mockCredProvider.EXPECT().Cleanup(gomock.Any()).Return(nil)
@@ -584,8 +617,8 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx := setupDM(t)
 			target := testCtx.targetPath(testCtx.podUID)
 
-			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.volumeID)
-			expectedEnvPath := filepath.Join("/comm", testCtx.volumeID)
+			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.pvUID)
+			expectedEnvPath := filepath.Join("/comm", testCtx.pvUID)
 
 			// The fresh mount cleans before it provides, discarding anything an earlier mount left.
 			mockCredProvider.EXPECT().Cleanup(gomock.Any()).Return(nil)
@@ -679,7 +712,7 @@ func TestDaemonsetMounter(t *testing.T) {
 			}
 
 			// Construct error file path
-			mountId := testCtx.volumeID
+			mountId := testCtx.pvUID
 			errFilePath := filepath.Join(testCtx.commDir, mounter.GetErrorFileName(mountId))
 
 			mountRes := make(chan error)
@@ -741,7 +774,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				t.Fatal("target should be mounted after Mount")
 			}
 
-			uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, testCtx.volumeID))[0])
+			uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, testCtx.pvUID))[0])
 			assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(uid))
 
 			err = testCtx.dm.Unmount(testCtx.ctx, target, credentialprovider.CleanupContext{
@@ -1002,6 +1035,17 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, fs.FileMode(0600), testCtx.modeOf(sock))
 	})
 
+	t.Run("Mounts a PV named after the mount socket without taking the socket over", func(t *testing.T) {
+		testCtx := setupDM(t)
+		testCtx.usePV(mounter.MountSockName)
+
+		testCtx.mountAndServe(testCtx.podUID, nil)
+
+		sock := filepath.Join(testCtx.commDir, mounter.MountSockName)
+		assert.Equals(t, [2]int{0, 0}, testCtx.ownerOf(sock))
+		assert.Equals(t, fs.FileMode(0600), testCtx.modeOf(sock))
+	})
+
 	t.Run("Keeps one UID across retries of a failed mount", func(t *testing.T) {
 		testCtx := setupDM(t)
 
@@ -1011,6 +1055,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.NoError(t, os.MkdirAll(filepath.Dir(metaDir), 0750))
 		assert.NoError(t, os.WriteFile(metaDir, nil, 0600))
 
+		testCtx.client.ClearActions()
 		for range 3 {
 			err := testCtx.dm.Mount(testCtx.ctx, testCtx.bucketName, testCtx.targetPath(testCtx.podUID),
 				credentialprovider.ProvideContext{
@@ -1023,6 +1068,8 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		// One UID in total: a retry that allocated again would have taken the next in the range.
 		assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart))
 		assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(mounter.UIDRangeStart+1))
+		// And one PV lookup: a retry also keeps the PV UID its files are named after.
+		assert.Equals(t, []string{"get persistentvolumes"}, testCtx.apiCalls())
 	})
 
 	t.Run("Gives the UID back when credential provisioning fails", func(t *testing.T) {
@@ -1101,7 +1148,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 			t.Fatalf("expected an allocated UID in [%d, %d], got %d", mounter.UIDRangeStart, mounter.UIDRangeEnd, uid)
 		}
 
-		credDir := filepath.Join(testCtx.commDir, testCtx.volumeID)
+		credDir := filepath.Join(testCtx.commDir, testCtx.pvUID)
 		assert.Equals(t, [2]int{uid, uid}, testCtx.ownerOf(credDir))
 		assert.Equals(t, credentialprovider.IsolatedCredentialDirPerm, testCtx.modeOf(credDir))
 

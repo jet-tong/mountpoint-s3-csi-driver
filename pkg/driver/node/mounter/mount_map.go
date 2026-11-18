@@ -94,12 +94,11 @@ type MountEntry struct {
 	// SourcePath is the path where the FUSE mount lives (one Mountpoint process).
 	SourcePath string
 
-	// VolumeID is the PV name, used as the sharing key, credential directory name,
-	// error file name, and mount identifier when communicating with the secondary daemonset.
+	// VolumeID is the PV name, used as the sharing key.
 	VolumeID string
 
-	// PVUID is the PV's metadata.uid, which names the mount's meta file: a PV name can take 253 of
-	// the 255 bytes a file name may have.
+	// PVUID is the PV's metadata.uid. It names the mount's files and is its mount ID with the
+	// mounter, as a PV name can take 253 of the 255 bytes a file name may have.
 	PVUID string
 
 	// CommDir is the comm directory path at the time this mount was created.

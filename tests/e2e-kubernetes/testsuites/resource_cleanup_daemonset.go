@@ -184,7 +184,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 		targetNode := pod.Spec.NodeName
 
 		checkWriteToPathSucceedEventually(ctx, f, pod, "/mnt/volume1/before.txt", 1024, time.Now().UTC().UnixNano())
-		uid := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), pvName)).uid
+		uid := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), string(resource.Pv.UID))).uid
 
 		ginkgo.By(fmt.Sprintf("Killing only this mount's Mountpoint (UID %d)", uid))
 		pid := mountpointProcessRunningAs(ctx, f, targetNode, uid).pid
@@ -240,7 +240,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 				verifyCSINodeLogs(ctx, f, targetNode, fmt.Sprintf("for volume %s not in mount table, cleaning up", pvName))
 		}).WithTimeout(time.Minute).WithPolling(cleanupObservePoll).Should(gomega.BeTrue(),
 			"csi-node must log the reclaim of volume %s's dead source", pvName)
-		credDir := filepath.Join(commDirHostPath(ctx, f, targetNode), pvName)
+		credDir := filepath.Join(commDirHostPath(ctx, f, targetNode), string(resource.Pv.UID))
 		_, err = execInCSINodePod(ctx, f, targetNode, fmt.Sprintf("test ! -e %q", credDir))
 		framework.ExpectNoError(err, "the reclaimed mount's credential directory %s must be removed", credDir)
 	})
@@ -279,7 +279,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 
 		ginkgo.By("Waiting for the publish to write the mount's credential directory")
 		gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
-			return queryCredentialDirStatus(ctx, f, targetNode, pvName)
+			return queryCredentialDirStatus(ctx, f, targetNode, pvUID)
 		}).WithTimeout(f.Timeouts.PodStart).WithPolling(250 * time.Millisecond).Should(gomega.Equal("EXISTS"))
 
 		// Recorded only to say in the log whether the kill really interrupted the publish; the assertions
@@ -316,7 +316,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 			"expected exactly 1 mount-s3 process for bucket %s after the retried publish", bucketName)
 
 		ginkgo.By("Checking the credential directory belongs to the UID the Mountpoint runs as")
-		credDirPath := filepath.Join(commDirHostPath(ctx, f, targetNode), pvName)
+		credDirPath := filepath.Join(commDirHostPath(ctx, f, targetNode), pvUID)
 		credDir := statPath(ctx, f, targetNode, credDirPath)
 		gomega.Expect(credDir.mode).To(gomega.Equal(expectedCredDirMode))
 		gomega.Expect(credDir.uid).To(gomega.And(
@@ -344,7 +344,7 @@ func (t *s3CSIResourceCleanupDaemonsetTestSuite) DefineTests(driver storageframe
 			return checkMetaFileExists(ctx, f, targetNode, pvUID)
 		}).WithTimeout(time.Minute).WithPolling(5*time.Second).Should(gomega.BeFalse(),
 			"the metadata for volume %s must be removed", pvName)
-		checkCredentialDirRemoved(ctx, f, targetNode, pvName)
+		checkCredentialDirRemoved(ctx, f, targetNode, pvUID)
 	})
 }
 

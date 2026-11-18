@@ -45,7 +45,7 @@ func TestMount_DeadTargetLifecycle(t *testing.T) {
 
 	// Absent target: a fresh mount goes all the way through.
 	testCtx.mountVolume()
-	uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, testCtx.volumeID))[0])
+	uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, testCtx.pvUID))[0])
 	assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(uid))
 
 	provideCtx := credentialprovider.ProvideContext{WorkloadPodID: testCtx.podUID, VolumeID: testCtx.volumeID}

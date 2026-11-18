@@ -882,13 +882,16 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 
 	// Create a comm dir with credential files that should be cleaned up
 	commDir := filepath.Join(kubeletPath, "pods", "mounter-uid", "volumes", "kubernetes.io~empty-dir", "comm")
-	credDir := filepath.Join(commDir, "vol-dead-creds")
+	credDir := filepath.Join(commDir, "vol-dead-creds-uid")
 	err := os.MkdirAll(credDir, 0750)
 	assert.NoError(t, err)
 	// Simulate a token file in the cred dir
 	os.WriteFile(filepath.Join(credDir, "token.jwt"), []byte("secret"), 0600)
 	// Simulate an error file
-	os.WriteFile(filepath.Join(commDir, "vol-dead-creds.error"), []byte("mount failed"), 0600)
+	os.WriteFile(filepath.Join(commDir, "vol-dead-creds-uid.error"), []byte("mount failed"), 0600)
+	// Stands in for the mount socket, which every mount shares
+	sock := filepath.Join(commDir, MountSockName)
+	assert.NoError(t, os.WriteFile(sock, nil, 0600))
 
 	entry := &MountEntry{
 		VolumeID:   "vol-dead-creds",
@@ -912,7 +915,7 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	}
 
 	// Error file should be cleaned up
-	_, err = os.Stat(filepath.Join(commDir, "vol-dead-creds.error"))
+	_, err = os.Stat(filepath.Join(commDir, "vol-dead-creds-uid.error"))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected error file to be removed for dead source")
 	}
@@ -922,6 +925,9 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	if !os.IsNotExist(err) {
 		t.Fatal("expected meta file to be removed for dead source")
 	}
+
+	// Only this mount's files go: a cleanup without the PV UID would name, and remove, the comm directory.
+	assert.NoError(t, statErr(sock))
 }
 
 // seedEntry inserts a source-mounted entry into the map. i.e pretend a mount already exists
@@ -974,8 +980,8 @@ func TestCleanupOrphans(t *testing.T) {
 			name: "dead source torn down, with its credentials and error file",
 			setup: func(t *testing.T, dm *DaemonsetMounter, _ *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, volumeID), 0750))
-				os.WriteFile(filepath.Join(commDir, volumeID+".error"), []byte("boom"), 0600)
+				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, pvUID), 0750))
+				os.WriteFile(filepath.Join(commDir, pvUID+".error"), []byte("boom"), 0600)
 				entry := seedEntry(dm, volumeID, pvUID, sourcePath, commDir, nil)
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
@@ -1114,8 +1120,8 @@ func TestCleanupOrphans(t *testing.T) {
 			if tt.expectCommGone {
 				// An orphan's credentials and error file must not outlive it.
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID))))
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID+".error"))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, pvUID))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, pvUID+".error"))))
 			}
 		})
 	}
