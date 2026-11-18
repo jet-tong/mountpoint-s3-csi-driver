@@ -183,14 +183,14 @@ func (t *s3CSIProxyTestSuite) DefineTests(driver storageframework.TestDriver, pa
 
 		if isDaemonsetMounterMode(ctx, f) {
 			// In daemonset mode mount-s3 runs in the shared mounter DaemonSet, which prefixes
-			// each log line with the mount id (the PV name). Match a line that is both for this
-			// volume ("[<pv-name>]") and shows the proxy tunnel, so we don't match other volumes.
+			// each log line with the mount id (uid-<N>). Match a line that is both for this
+			// volume ("[uid-<N>]") and shows the proxy tunnel, so we don't match other volumes.
 			mounterPods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
 				LabelSelector: "app=s3-csi-daemonset-mounter",
 			})
 			framework.ExpectNoError(err)
 
-			volumePrefix := fmt.Sprintf("[%s]", resource.Pv.Name)
+			volumePrefix := fmt.Sprintf("[%s]", mountID(mountUID(ctx, f, pod.Spec.NodeName, resource.Pv.Name)))
 			foundForVolume := false
 			for i := range mounterPods.Items {
 				p := &mounterPods.Items[i]

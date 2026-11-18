@@ -39,8 +39,7 @@ type Options struct {
 	Args       []string `json:"args"`
 	Env        []string `json:"env"`
 	// VolumeId is a unique mount identifier used by the daemonset mounter for child process
-	// tracking and error file naming. In daemonset mode this is "<podUID>-<volumeId>".
-	// With pod sharing it'll be "volumeID" (PersistentVolume: metadata.name).
+	// tracking and error file naming. s3-csi-node sends "uid-<N>", N being the Uid below.
 	VolumeId string `json:"volumeId,omitempty"`
 	// Uid and Gid are the process credentials the mounter must give the Mountpoint process it
 	// spawns, so the kernel isolates it from every other Mountpoint on the node.

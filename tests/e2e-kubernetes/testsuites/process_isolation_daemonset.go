@@ -2,6 +2,7 @@ package custom_testsuites
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -101,14 +102,13 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		pods = append(pods, createPodOnNode(ctx, f, targetNode, second)...)
 		defer deletePodsInOrder(ctx, f, pods)
 
-		// Each mount is identified by the UID csi-node chowned its credential directory to. Counting
+		// Each mount is identified by the UID csi-node recorded in its meta file. Counting
 		// mount-s3 processes instead would be satisfied by another spec's mounts, since specs run in
 		// parallel and share this node's mounter pod.
 		ginkgo.By("Reading the UID each of the two mounts was given")
-		commDir := commDirHostPath(ctx, f, targetNode)
 		uids := []int{
-			statPath(ctx, f, targetNode, filepath.Join(commDir, first.Pv.Name)).uid,
-			statPath(ctx, f, targetNode, filepath.Join(commDir, second.Pv.Name)).uid,
+			mountUID(ctx, f, targetNode, first.Pv.Name),
+			mountUID(ctx, f, targetNode, second.Pv.Name),
 		}
 		gomega.Expect(uids[0]).ToNot(gomega.Equal(uids[1]),
 			"two mounts on one node must be given different UIDs, both got %d", uids[0])
@@ -164,7 +164,7 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		gomega.Eventually(ctx, func(ctx context.Context) (int, error) {
 			return countFuseMountsForVolume(ctx, f, targetNode, pvName), nil
 		}).WithTimeout(mountpointProcessTimeout).WithPolling(mountpointProcessPoll).Should(gomega.Equal(1))
-		uid := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), pvName)).uid
+		uid := mountUID(ctx, f, targetNode, pvName)
 
 		ginkgo.By(fmt.Sprintf("Attempting to switch from the mount's UID %d back to root", uid))
 		asMount := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", uid, uid)
@@ -208,7 +208,7 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		gomega.Expect(sock.gid).To(gomega.Equal(0))
 
 		ginkgo.By("Checking the per-mount credential directory belongs to the mount's UID")
-		credDirPath := commDir + "/" + pvName
+		credDirPath := commDir + "/" + mountID(mountUID(ctx, f, targetNode, pvName))
 		credDir := statPath(ctx, f, targetNode, credDirPath)
 		gomega.Expect(credDir.mode).To(gomega.Equal(expectedCredDirMode))
 		gomega.Expect(credDir.uid).To(gomega.And(
@@ -259,7 +259,8 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		defer deletePodsInOrder(ctx, f, []*v1.Pod{pod})
 		targetNode := pod.Spec.NodeName
 
-		credDirPath := commDirHostPath(ctx, f, targetNode) + "/" + pvName
+		uid := mountUID(ctx, f, targetNode, pvName)
+		credDirPath := commDirHostPath(ctx, f, targetNode) + "/" + mountID(uid)
 		credDir := statPath(ctx, f, targetNode, credDirPath)
 
 		// `-A` so a credential file whose name begins with a dot is listed too, without picking up "."
@@ -287,12 +288,12 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 		l.resources = append(l.resources, other)
 		otherPods := createPodOnNode(ctx, f, targetNode, other)
 		defer deletePodsInOrder(ctx, f, otherPods)
-		otherUID := statPath(ctx, f, targetNode, filepath.Join(commDirHostPath(ctx, f, targetNode), other.Pv.Name)).uid
+		otherUID := mountUID(ctx, f, targetNode, other.Pv.Name)
 		gomega.Expect(otherUID).ToNot(gomega.Equal(credDir.uid), "the two mounts must have different UIDs")
 
 		asOther := fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups", otherUID, otherUID)
 		for _, file := range files {
-			tokenPath := fmt.Sprintf("/comm/%s/%s", pvName, file)
+			tokenPath := fmt.Sprintf("/comm/%s/%s", mountID(uid), file)
 			ginkgo.By(fmt.Sprintf("Confirming UID %d cannot open %s", otherUID, tokenPath))
 			out, stderr, err := execInMounterPod(ctx, f, targetNode, asOther+" cat "+tokenPath)
 			gomega.Expect(err).To(gomega.HaveOccurred(),
@@ -324,11 +325,12 @@ func (t *s3CSIProcessIsolationDaemonsetTestSuite) DefineTests(driver storagefram
 
 		// /comm is 0711 so root may traverse it; the directory itself is 0700 and owned by the mount.
 		ginkgo.By("Confirming the mounter can reach the credential directory")
-		mode, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("stat -c '%%a' /comm/%s", pvName))
+		credDir := "/comm/" + mountID(mountUID(ctx, f, targetNode, pvName))
+		mode, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("stat -c '%%a' %s", credDir))
 		framework.ExpectNoError(err, "the mounter should be able to stat the credential directory via 0711 /comm: %s", stderr)
 		gomega.Expect(strings.TrimSpace(mode)).To(gomega.Equal(expectedCredDirMode))
 
-		out, stderr, err := execInMounterPod(ctx, f, targetNode, fmt.Sprintf("ls -A /comm/%s", pvName))
+		out, stderr, err := execInMounterPod(ctx, f, targetNode, "ls -A "+credDir)
 		if dacOverride {
 			ginkgo.By("Confirming the mounter, which holds CAP_DAC_OVERRIDE, can list the credential directory")
 			framework.ExpectNoError(err, "the mounter holds CAP_DAC_OVERRIDE, so it should be able to list %s: %s", pvName, stderr)
@@ -485,4 +487,23 @@ func commDirHostPath(ctx context.Context, f *framework.Framework, nodeName strin
 	pod, err := podOnNode(ctx, f, mounterPodLabel, nodeName)
 	framework.ExpectNoError(err)
 	return fmt.Sprintf("/var/lib/kubelet/pods/%s/volumes/kubernetes.io~empty-dir/comm", pod.UID)
+}
+
+// mountUID returns the UID csi-node gave the mount of `pvName` on `nodeName`, read from the mount's meta file, waiting
+// for a publish in flight to write it.
+func mountUID(ctx context.Context, f *framework.Framework, nodeName, pvName string) int {
+	var meta struct {
+		UID int `json:"uid"`
+	}
+	gomega.Eventually(ctx, func(ctx context.Context) error {
+		return json.Unmarshal([]byte(readMetaFileContent(ctx, f, nodeName, pvName)), &meta)
+	}).WithTimeout(f.Timeouts.PodStart).WithPolling(250*time.Millisecond).Should(gomega.Succeed(),
+		"no meta file on node %s records volume %s", nodeName, pvName)
+	return meta.UID
+}
+
+// mountID is how csi-node names the mount whose Mountpoint runs as `uid`: its credential directory in the comm
+// directory, and the mount ID in the mounter's log.
+func mountID(uid int) string {
+	return fmt.Sprintf("uid-%d", uid)
 }

@@ -225,10 +225,11 @@ func checkWriteAndRead(ctx context.Context, f *framework.Framework, pod *v1.Pod)
 func servingMounter(ctx context.Context, f *framework.Framework, node, pvName string) string {
 	GinkgoHelper()
 	var served []string
+	request := "Received mount request for mount " + mountID(mountUID(ctx, f, node, pvName)) + ","
 	for _, mounter := range mountersOn(ctx, f, node) {
 		logs, err := e2epod.GetPodLogs(ctx, f.ClientSet, mounter.Namespace, mounter.Name, mounterContainerName)
 		framework.ExpectNoError(err)
-		if strings.Contains(logs, "Received mount request for mount "+pvName) {
+		if strings.Contains(logs, request) {
 			served = append(served, mounter.Name)
 		}
 	}
