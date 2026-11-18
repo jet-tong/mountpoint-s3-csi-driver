@@ -865,13 +865,13 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 
 	// Create a comm dir with credential files that should be cleaned up
 	commDir := filepath.Join(kubeletPath, "pods", "mounter-uid", "volumes", "kubernetes.io~empty-dir", "comm")
-	credDir := filepath.Join(commDir, "vol-dead-creds")
+	credDir := filepath.Join(commDir, pvFileName("vol-dead-creds"))
 	err := os.MkdirAll(credDir, 0750)
 	assert.NoError(t, err)
 	// Simulate a token file in the cred dir
 	os.WriteFile(filepath.Join(credDir, "token.jwt"), []byte("secret"), 0600)
 	// Simulate an error file
-	os.WriteFile(filepath.Join(commDir, "vol-dead-creds.error"), []byte("mount failed"), 0600)
+	os.WriteFile(filepath.Join(commDir, pvFileName("vol-dead-creds")+".error"), []byte("mount failed"), 0600)
 
 	entry := &MountEntry{
 		VolumeID:   "vol-dead-creds",
@@ -894,7 +894,7 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	}
 
 	// Error file should be cleaned up
-	_, err = os.Stat(filepath.Join(commDir, "vol-dead-creds.error"))
+	_, err = os.Stat(filepath.Join(commDir, pvFileName("vol-dead-creds")+".error"))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected error file to be removed for dead source")
 	}
@@ -955,8 +955,8 @@ func TestCleanupOrphans(t *testing.T) {
 			name: "dead source torn down, with its credentials and error file",
 			setup: func(t *testing.T, dm *DaemonsetMounter, _ *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, volumeID), 0750))
-				os.WriteFile(filepath.Join(commDir, volumeID+".error"), []byte("boom"), 0600)
+				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, pvFileName(volumeID)), 0750))
+				os.WriteFile(filepath.Join(commDir, pvFileName(volumeID)+".error"), []byte("boom"), 0600)
 				entry := seedEntry(dm, volumeID, sourcePath, commDir, nil)
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
@@ -1095,8 +1095,8 @@ func TestCleanupOrphans(t *testing.T) {
 			if tt.expectCommGone {
 				// An orphan's credentials and error file must not outlive it.
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID))))
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID+".error"))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, pvFileName(volumeID)))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, pvFileName(volumeID)+".error"))))
 			}
 		})
 	}

@@ -1501,7 +1501,7 @@ func listCommDirContents(ctx context.Context, f *framework.Framework, nodeName, 
 		framework.Logf("DEBUG: Could not find mounter pod for listing: %v", err)
 		return
 	}
-	cmd := fmt.Sprintf("echo '--- /comm/ top-level ---'; ls -la /comm/ 2>&1; echo '--- /comm/%s/ ---'; ls -la /comm/%s/ 2>&1 || true", volumeID, volumeID)
+	cmd := fmt.Sprintf("echo '--- /comm/ top-level ---'; ls -la /comm/ 2>&1; echo '--- /comm/%s/ ---'; ls -la /comm/%s/ 2>&1 || true", pvFileName(volumeID), pvFileName(volumeID))
 	stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, pods.Items[0].Name, "mounter", []string{"/bin/sh", "-c", cmd})
 	if err != nil {
 		framework.Logf("DEBUG: listing /comm/ failed: %v", err)
@@ -1522,7 +1522,7 @@ func queryCredentialDirStatus(ctx context.Context, f *framework.Framework, nodeN
 	}
 
 	mounterPod := &pods.Items[0]
-	credDir := fmt.Sprintf("/comm/%s", volumeID)
+	credDir := fmt.Sprintf("/comm/%s", pvFileName(volumeID))
 	cmd := fmt.Sprintf("test -d %s && echo EXISTS || echo MISSING", credDir)
 
 	stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, mounterPod.Name, "mounter", []string{"/bin/sh", "-c", cmd})

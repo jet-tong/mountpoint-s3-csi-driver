@@ -228,7 +228,7 @@ func servingMounter(ctx context.Context, f *framework.Framework, node, pvName st
 	for _, mounter := range mountersOn(ctx, f, node) {
 		logs, err := e2epod.GetPodLogs(ctx, f.ClientSet, mounter.Namespace, mounter.Name, mounterContainerName)
 		framework.ExpectNoError(err)
-		if strings.Contains(logs, "Received mount request for mount "+pvName) {
+		if strings.Contains(logs, "Received mount request for mount "+pvFileName(pvName)) {
 			served = append(served, mounter.Name)
 		}
 	}

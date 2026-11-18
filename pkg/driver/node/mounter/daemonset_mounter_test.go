@@ -2,6 +2,7 @@ package mounter_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -82,6 +83,11 @@ func (testCtx *dmTestCtx) modeOf(path string) fs.FileMode {
 // Format: <kubeletPath>/pods/<podUID>/volumes/kubernetes.io~csi/<volumeID>/mount
 func (testCtx *dmTestCtx) targetPath(podUID string) string {
 	return filepath.Join(testCtx.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~csi", testCtx.volumeID, "mount")
+}
+
+// pvFileName is the name s3-csi-node gives a PV's files and mount ID, derived here independently of the mounter package.
+func pvFileName(pvName string) string {
+	return fmt.Sprintf("pv-%x", sha256.Sum256([]byte(pvName)))
 }
 
 func setupDM(t *testing.T) *dmTestCtx {
@@ -399,9 +405,10 @@ func TestDaemonsetMounter(t *testing.T) {
 				BucketName: testCtx.bucketName,
 				// --uid and --gid carry the default, so the ownership the mount presents does not follow
 				// the UID below that the process runs as.
-				Args:     []string{"--gid=1000", "--prefix=data/", "--uid=1000", expectedUserAgent},
-				Env:      env.List(),
-				VolumeId: testCtx.volumeID,
+				Args: []string{"--gid=1000", "--prefix=data/", "--uid=1000", expectedUserAgent},
+				Env:  env.List(),
+				// "pv-" and the sha256 of the PV name, as `printf %s s3-csi-driver-volume | sha256sum` prints it.
+				VolumeId: "pv-361ce1404d0dd8cd3f2555c81913ab821c3f2d6dfc2d7f598eef962aadcb84aa",
 				// The first mount on a fresh allocator takes the bottom of the range.
 				Uid: mounter.UIDRangeStart,
 				Gid: mounter.UIDRangeStart,
@@ -413,7 +420,7 @@ func TestDaemonsetMounter(t *testing.T) {
 
 			// A directory that outlived its map entry, so this mount is the entry's first attempt and has
 			// nothing recorded to clean. Its contents belong to whoever mounted this PV before.
-			credDir := filepath.Join(testCtx.commDir, testCtx.volumeID)
+			credDir := filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID))
 			assert.NoError(t, os.MkdirAll(credDir, 0700))
 			stale := filepath.Join(credDir, "token")
 			assert.NoError(t, os.WriteFile(stale, []byte("an-earlier-mounts-token"), 0400))
@@ -459,9 +466,9 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx := setupDM(t)
 			target := testCtx.targetPath(testCtx.podUID)
 
-			// volumeID is the PV name extracted from target path — used as credential dir name
-			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.volumeID)
-			expectedEnvPath := filepath.Join("/comm", testCtx.volumeID)
+			// volumeID is the PV name extracted from target path, and its pvFileName names the credential dir
+			expectedWritePath := filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID))
+			expectedEnvPath := filepath.Join("/comm", pvFileName(testCtx.volumeID))
 
 			// The fresh mount cleans before it provides, discarding anything an earlier mount left.
 			mockCredProvider.EXPECT().Cleanup(gomock.Any()).Return(nil)
@@ -514,8 +521,8 @@ func TestDaemonsetMounter(t *testing.T) {
 			testCtx := setupDM(t)
 			target := testCtx.targetPath(testCtx.podUID)
 
-			expectedWritePath := filepath.Join(testCtx.commDir, testCtx.volumeID)
-			expectedEnvPath := filepath.Join("/comm", testCtx.volumeID)
+			expectedWritePath := filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID))
+			expectedEnvPath := filepath.Join("/comm", pvFileName(testCtx.volumeID))
 
 			// The fresh mount cleans before it provides, discarding anything an earlier mount left.
 			mockCredProvider.EXPECT().Cleanup(gomock.Any()).Return(nil)
@@ -608,9 +615,8 @@ func TestDaemonsetMounter(t *testing.T) {
 				return fd, nil
 			}
 
-			// Construct error file path
-			mountId := testCtx.volumeID
-			errFilePath := filepath.Join(testCtx.commDir, mounter.GetErrorFileName(mountId))
+			// Construct error file path, as the mounter names it after the mount ID
+			errFilePath := filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID)+".error")
 
 			mountRes := make(chan error)
 			go func() {
@@ -671,7 +677,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				t.Fatal("target should be mounted after Mount")
 			}
 
-			uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, testCtx.volumeID))[0])
+			uid := uint32(testCtx.ownerOf(filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID)))[0])
 			assert.Equals(t, true, testCtx.dm.UIDInUseForTesting(uid))
 
 			err = testCtx.dm.Unmount(testCtx.ctx, target, credentialprovider.CleanupContext{
@@ -688,6 +694,22 @@ func TestDaemonsetMounter(t *testing.T) {
 
 			// The mount is gone, so its UID is available to the next one.
 			assert.Equals(t, false, testCtx.dm.UIDInUseForTesting(uid))
+		})
+
+		t.Run("Leaves nothing in the comm directory after a PV with a 253-byte name is mounted and unmounted", func(t *testing.T) {
+			testCtx := setupDM(t)
+			// The longest valid PV name: a 253-byte DNS subdomain, in labels of at most 63 bytes.
+			testCtx.volumeID = strings.Join([]string{strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61)}, ".")
+
+			testCtx.mountVolume()
+			assert.NoError(t, testCtx.dm.Unmount(testCtx.ctx, testCtx.targetPath(testCtx.podUID), credentialprovider.CleanupContext{
+				PodID:    testCtx.podUID,
+				VolumeID: testCtx.volumeID,
+			}))
+
+			leftovers, err := filepath.Glob(filepath.Join(testCtx.commDir, "*"))
+			assert.NoError(t, err)
+			assert.Equals(t, []string(nil), leftovers)
 		})
 	})
 
@@ -932,6 +954,16 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 		assert.Equals(t, fs.FileMode(0600), testCtx.modeOf(sock))
 	})
 
+	t.Run("Mounts a PV named after the mount socket and leaves the socket root-owned", func(t *testing.T) {
+		testCtx := setupDM(t)
+		testCtx.volumeID = mounter.MountSockName
+		testCtx.mountVolume()
+
+		sock := filepath.Join(testCtx.commDir, mounter.MountSockName)
+		assert.Equals(t, [2]int{0, 0}, testCtx.ownerOf(sock))
+		assert.Equals(t, fs.FileMode(0600), testCtx.modeOf(sock))
+	})
+
 	t.Run("Keeps one UID across retries of a failed mount", func(t *testing.T) {
 		testCtx := setupDM(t)
 
@@ -1031,7 +1063,7 @@ func TestDaemonsetMounter_PathOwnership(t *testing.T) {
 			t.Fatalf("expected an allocated UID in [%d, %d], got %d", mounter.UIDRangeStart, mounter.UIDRangeEnd, uid)
 		}
 
-		credDir := filepath.Join(testCtx.commDir, testCtx.volumeID)
+		credDir := filepath.Join(testCtx.commDir, pvFileName(testCtx.volumeID))
 		assert.Equals(t, [2]int{uid, uid}, testCtx.ownerOf(credDir))
 		assert.Equals(t, credentialprovider.IsolatedCredentialDirPerm, testCtx.modeOf(credDir))
 
