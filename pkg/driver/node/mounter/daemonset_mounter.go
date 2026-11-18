@@ -1512,6 +1512,12 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, err)
 		}
 
+		// A meta file recording another volume, or none, would send that volume's files to the cleanup below.
+		if meta.VolumeID == "" || metaPath != MetaFileName(dm.kubeletPath, meta.VolumeID) {
+			return fmt.Errorf("mount meta %s is not named for the volume it records, %q. "+
+				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, meta.VolumeID)
+		}
+
 		if err := dm.uidAllocator.Reserve(meta.Uid); err != nil {
 			klog.Warningf("MountMap: not reserving UID for volume %s: %v", meta.VolumeID, err)
 		}

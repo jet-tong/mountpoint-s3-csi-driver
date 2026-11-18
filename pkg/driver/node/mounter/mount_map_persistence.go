@@ -2,6 +2,8 @@
 package mounter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,7 +17,14 @@ import (
 // Meta files live in a dedicated directory separate from FUSE source mounts to avoid
 // collisions with PV names that could end in ".meta.json".
 func MetaFileName(kubeletPath, volumeID string) string {
-	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", volumeID+".meta.json")
+	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", pvFileName(volumeID)+".meta.json")
+}
+
+// pvFileName returns the name s3-csi-node gives the files it keeps for the PV `pvName`.
+func pvFileName(pvName string) string {
+	// A PV name can be 253 bytes, too long to take a suffix within a 255-byte file name.
+	sum := sha256.Sum256([]byte(pvName))
+	return "pv-" + hex.EncodeToString(sum[:])
 }
 
 // MountMeta is the JSON-serializable structure persisted alongside each source mount.

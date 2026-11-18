@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -236,7 +237,8 @@ func TestReadMeta_FileNotFound(t *testing.T) {
 
 func TestMetaFileName_Format(t *testing.T) {
 	path := MetaFileName("/var/lib/kubelet", "vol-test-123")
-	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/vol-test-123.meta.json"
+	// "pv-" and the sha256 of the PV name, as `printf %s vol-test-123 | sha256sum` prints it.
+	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/pv-70108948d9ad6b77c4c8dd48db3aa83aed6fe5c64b88e72eb3bfd7cb56d30681.meta.json"
 	assert.Equals(t, expected, path)
 }
 
@@ -399,6 +401,39 @@ func TestRebuildMountMap_FailsOnInvalidMetaJSON(t *testing.T) {
 
 	if dm.mountMap.Get("vol-bad") != nil {
 		t.Fatal("should not create entry for invalid meta")
+	}
+}
+
+func TestRebuildMountMap_FailsOnMetaNotNamedForItsVolume(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		// namedFor is the volume the meta file is named for; recorded is the volumeID inside it.
+		namedFor, recorded string
+	}{
+		{name: "A meta file recording another volume", namedFor: "pv-a", recorded: "pv-b"},
+		// Named as a volume called "" would be, so only the empty volumeID gives it away.
+		{name: "A meta file recording no volume", namedFor: "", recorded: ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			kubeletPath := t.TempDir()
+			metaPath := MetaFileName(kubeletPath, testCase.namedFor)
+			assert.NoError(t, os.MkdirAll(filepath.Dir(metaPath), 0750))
+			data, err := json.Marshal(MountMeta{VolumeID: testCase.recorded, VolumeHandle: "handle"})
+			assert.NoError(t, err)
+			assert.NoError(t, os.WriteFile(metaPath, data, 0600))
+
+			// Not in the mount table, so the dead-source cleanup would remove it.
+			recordedSource := SourceMountPath(kubeletPath, testCase.recorded)
+			assert.NoError(t, os.MkdirAll(recordedSource, 0750))
+
+			dm := newTestDMWithMountInfoAndCredProvider(kubeletPath, fakeMountInfoProvider(nil))
+			err = dm.RebuildMountMap()
+			if err == nil {
+				t.Fatal("expected RebuildMountMap to fail on a meta file not named for the volume it records")
+			}
+			assert.Contains(t, err.Error(), metaPath)
+			assert.NoError(t, statErr(recordedSource))
+		})
 	}
 }
 
@@ -751,6 +786,32 @@ func TestWriteReadMetaCycle(t *testing.T) {
 	for i, opt := range entry.Params.MountOptions {
 		assert.Equals(t, opt, meta.MountOptions[i])
 	}
+}
+
+func TestWriteRebuildRemoveMeta_253BytePVName(t *testing.T) {
+	kubeletPath := t.TempDir()
+	// The longest valid PV name: a 253-byte DNS subdomain, in labels of at most 63 bytes.
+	pvName := strings.Join([]string{strings.Repeat("a", 63), strings.Repeat("b", 63), strings.Repeat("c", 63), strings.Repeat("d", 61)}, ".")
+	sourcePath := SourceMountPath(kubeletPath, pvName)
+
+	assert.NoError(t, WriteMeta(kubeletPath, &MountEntry{
+		VolumeID:   pvName,
+		SourcePath: sourcePath,
+		Params:     MountParams{VolumeHandle: "handle-253"},
+	}))
+
+	dm := newTestDMWithMountInfo(kubeletPath, fakeMountInfoProvider([]mountutils.MountInfo{
+		{MountPoint: sourcePath, Major: 0, Minor: 42},
+	}))
+	assert.NoError(t, dm.RebuildMountMap())
+	if dm.mountMap.Get(pvName) == nil {
+		t.Fatal("expected RebuildMountMap to recover the volume from its meta file")
+	}
+
+	assert.NoError(t, RemoveMeta(kubeletPath, pvName))
+	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(MetaFileName(kubeletPath, pvName)), "*"))
+	assert.NoError(t, err)
+	assert.Equals(t, []string(nil), leftovers)
 }
 
 func TestRemoveMeta_OnlyRemovesTargetVolume(t *testing.T) {
