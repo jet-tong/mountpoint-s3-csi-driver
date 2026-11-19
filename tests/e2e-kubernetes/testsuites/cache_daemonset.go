@@ -191,7 +191,7 @@ func (t *s3CSIDaemonsetCacheTestSuite) DefineTests(driver storageframework.TestD
 					// The mounter holds CAP_DAC_OVERRIDE to remove cache directories, so use another UID to simulate a different mount's Mountpoint
 					By("Confirming another UID cannot read inside the PV's cache or credential directory")
 					otherUID := m.uid + 1
-					for _, dir := range []string{m.cacheDir, filepath.Join("/comm", m.vol.Pv.Name)} {
+					for _, dir := range []string{m.cacheDir, filepath.Join("/comm", mountID(m.uid))} {
 						out, stderr, err := execInMounterPod(ctx, f, m.node,
 							fmt.Sprintf("setpriv --reuid=%d --regid=%d --clear-groups ls %s", otherUID, otherUID, dir))
 						Expect(err).To(HaveOccurred(), "UID %d listed %s: %q", otherUID, dir, out)
@@ -311,7 +311,7 @@ func (t *s3CSIDaemonsetCacheTestSuite) DefineTests(driver storageframework.TestD
 						e2epod.MakePod(f.Namespace.Name, tc.nodeSelector, []*v1.PersistentVolumeClaim{vol.Pvc}, admissionapi.LevelBaseline, ""))
 					framework.ExpectNoError(err)
 					DeferCleanup(func(ctx context.Context) error { return e2epod.DeletePodWithWait(ctx, f.ClientSet, pod) })
-					uid := statPath(ctx, f, pod.Spec.NodeName, filepath.Join(commDirHostPath(ctx, f, pod.Spec.NodeName), vol.Pv.Name)).uid
+					uid := mountUID(ctx, f, pod.Spec.NodeName, vol.Pv.Name)
 					m := cachedMount{vol: vol, pod: pod, node: pod.Spec.NodeName, uid: uid,
 						cacheDir: filepath.Join(cacheMountPath, fmt.Sprintf("uid-%d", uid))}
 
@@ -437,8 +437,8 @@ func mountCachedVolume(ctx context.Context, f *framework.Framework, config *stor
 		e2epod.MakePod(f.Namespace.Name, nodeSelector, []*v1.PersistentVolumeClaim{vol.Pvc}, admissionapi.LevelBaseline, ""))
 	framework.ExpectNoError(err)
 	DeferCleanup(func(ctx context.Context) error { return e2epod.DeletePodWithWait(ctx, f.ClientSet, pod) })
-	// s3-csi-node chowns the mount's credential directory to the UID it allocated, so the UID does not come from the mounter.
-	uid := statPath(ctx, f, pod.Spec.NodeName, filepath.Join(commDirHostPath(ctx, f, pod.Spec.NodeName), vol.Pv.Name)).uid
+	// s3-csi-node records the UID it allocated in the mount's meta file, so the UID does not come from the mounter.
+	uid := mountUID(ctx, f, pod.Spec.NodeName, vol.Pv.Name)
 	return cachedMount{vol: vol, pod: pod, node: pod.Spec.NodeName, uid: uid,
 		cacheDir: filepath.Join(cacheMountPath, fmt.Sprintf("uid-%d", uid))}
 }

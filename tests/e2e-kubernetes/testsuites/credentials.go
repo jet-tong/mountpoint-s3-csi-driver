@@ -221,7 +221,7 @@ func (t *s3CSICredentialsTestSuite) DefineTests(driver storageframework.TestDriv
 		pvc, err := f.ClientSet.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, claim, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 		node := pod.Spec.NodeName
-		credDir := filepath.Join(commDirHostPath(ctx, f, node), pvc.Spec.VolumeName)
+		credDir := filepath.Join(commDirHostPath(ctx, f, node), mountID(mountUID(ctx, f, node, pvc.Spec.VolumeName)))
 		owner := statPath(ctx, f, node, credDir).uid
 		gomega.Expect(owner).NotTo(gomega.Equal(0), "the mount's credential directory %s must belong to the mount's UID", credDir)
 
@@ -815,7 +815,7 @@ func (t *s3CSICredentialsTestSuite) DefineTests(driver storageframework.TestDriv
 					expectFullAccess(ctx, pod)
 
 					node := pod.Spec.NodeName
-					tokenPath := filepath.Join(commDirHostPath(ctx, f, node), vol.Pv.Name, "token")
+					tokenPath := filepath.Join(commDirHostPath(ctx, f, node), mountID(mountUID(ctx, f, node, vol.Pv.Name)), "token")
 					// Inode, mode, owner and group: the atomic rewrite gives the file a new inode.
 					statToken := func(ctx context.Context) ([]string, error) {
 						out, err := execInCSINodePod(ctx, f, node, fmt.Sprintf("stat -c '%%i %%a %%u %%g %%s' %q", tokenPath))

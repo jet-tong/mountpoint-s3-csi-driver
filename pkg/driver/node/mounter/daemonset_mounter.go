@@ -248,7 +248,7 @@ func (dm *DaemonsetMounter) SetS3PACache(cache client.Reader) {
 //     - Healthy source → validate compatibility (reject incompatible params before any cred writes)
 //  4. If source not mounted (fresh, dead-source recovery, or prior failed attempt):
 //     - Clean up any stale resources via cleanupMount (idempotent); fail mount if cleanup fails
-//     - Claim a UID from the allocator unless the entry already holds one
+//     - Claim a UID from the allocator unless the entry already holds one; clean up again for a new one
 //     - Write meta file (the durable record of that UID), set SourcePath/CommDir on the entry
 //  5. Provision credentials, written owned by the entry's UID (under lock to avoid race with
 //     cleanup on failure)
@@ -425,7 +425,7 @@ func (dm *DaemonsetMounter) mountOrShareSource(ctx context.Context, bucketName s
 	// Provision credentials under the lock. We always use entry.CommDir which is set above
 	// (either from an existing healthy entry, or freshly assigned from the mounter's comm dir on new mount).
 	// This ensures credentials are written to the same location that cleanup will look at.
-	credsEnv, authSource, err := dm.provideCredentials(ctx, entry.CommDir, volumeID, entry.Uid, &credentialCtx)
+	credsEnv, authSource, err := dm.provideCredentials(ctx, entry.CommDir, entry.Uid, &credentialCtx)
 	if err != nil {
 		// Only tear down if the source mount is not present or stale.
 		if !entry.sourceMounted {
@@ -525,7 +525,7 @@ func (dm *DaemonsetMounter) resolveExistingSource(ctx context.Context, entry *Mo
 func (dm *DaemonsetMounter) prepareFreshMount(entry *MountEntry, volumeID, commDir string,
 	incomingParams MountParams, credentialCtx credentialprovider.ProvideContext) error {
 
-	// Set before the cleanup below so that it covers the credential directory. This prevents one left
+	// Set before the cleanups below so that they cover the credential directory. This prevents one left
 	// by an earlier mount from being adopted instead of discarded.
 	entry.CommDir = commDir
 
@@ -560,6 +560,11 @@ func (dm *DaemonsetMounter) prepareFreshMount(entry *MountEntry, volumeID, commD
 			return fmt.Errorf("failed to allocate a UID for volume %s: %w", volumeID, err)
 		}
 		entry.Uid = uid
+
+		// A released UID is handed out again, and the cleanup above had none to find an earlier mount's files by.
+		if err := dm.cleanupMount(entry, credentialCtx.ToCleanupCtx()); err != nil {
+			return fmt.Errorf("failed to clean up stale resources of UID %d for volume %s, cannot proceed with fresh mount: %w", uid, volumeID, err)
+		}
 	}
 
 	if err := WriteMeta(dm.kubeletPath, entry); err != nil {
@@ -615,10 +620,10 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	}
 
 	sockPath := filepath.Join(mounter.commDir, MountSockName)
-	errFilePath := filepath.Join(mounter.commDir, GetErrorFileName(volumeID))
+	errFilePath := filepath.Join(mounter.commDir, GetErrorFileName(uid))
 	os.Remove(errFilePath)
 
-	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", volumeID, sockPath)
+	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s, volume %s) to %s", mountID(uid), volumeID, sockPath)
 
 	sendCtx, sendCancel := context.WithTimeout(ctx, sendOptionsTimeout)
 	defer sendCancel()
@@ -628,7 +633,7 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 		BucketName: bucketName,
 		Args:       args.SortedList(),
 		Env:        env.List(),
-		VolumeId:   volumeID,
+		VolumeId:   mountID(uid),
 		Uid:        uid,
 		Gid:        uid,
 	})
@@ -866,7 +871,7 @@ func (dm *DaemonsetMounter) teardownEntry(volumeID string, entry *MountEntry,
 // failed removal keeps both the UID and the entry, so the periodic cleanup retries. Caller must hold
 // entry.mu.
 func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
-	if err := RemoveMeta(dm.kubeletPath, volumeID); err != nil {
+	if err := RemoveMeta(dm.kubeletPath, entry.Uid); err != nil {
 		klog.Errorf("DaemonsetMounter: %v for volume %s, keeping in-memory tracking (will retry next cleanup)",
 			err, volumeID)
 		return
@@ -875,9 +880,9 @@ func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
 	dm.mountMap.Delete(volumeID)
 }
 
-// GetErrorFileName returns the error file name for a given volume ID.
-func GetErrorFileName(volumeID string) string {
-	return volumeID + MountErrorSuffix
+// GetErrorFileName returns the error file name of the mount whose Mountpoint runs as `uid`.
+func GetErrorFileName(uid uint32) string {
+	return mountID(uid) + MountErrorSuffix
 }
 
 // cleanupMount removes all resources associated with a mount entry.
@@ -886,13 +891,13 @@ func GetErrorFileName(volumeID string) string {
 func (dm *DaemonsetMounter) cleanupMount(entry *MountEntry, credentialCtx credentialprovider.CleanupContext) error {
 	var errs []error
 
-	// Clean credential files and error file (both live in commDir)
-	if entry.CommDir != "" {
-		if err := dm.cleanupCredentials(entry.CommDir, entry.VolumeID, credentialCtx); err != nil {
+	// Clean credential files and error file (both live in commDir and are named by the UID, which a fresh entry lacks)
+	if entry.CommDir != "" && entry.Uid != 0 {
+		if err := dm.cleanupCredentials(entry.CommDir, entry.Uid, credentialCtx); err != nil {
 			klog.Errorf("DaemonsetMounter: cleanup credentials for volume %s: %v", entry.VolumeID, err)
 			errs = append(errs, err)
 		}
-		errFile := filepath.Join(entry.CommDir, GetErrorFileName(entry.VolumeID))
+		errFile := filepath.Join(entry.CommDir, GetErrorFileName(entry.Uid))
 		if err := os.Remove(errFile); err != nil && !os.IsNotExist(err) {
 			klog.Errorf("DaemonsetMounter: cleanup error file %s: %v", errFile, err)
 			errs = append(errs, err)
@@ -1263,13 +1268,13 @@ func (dm *DaemonsetMounter) findV2S3PodAttachment(ctx context.Context, pvName st
 }
 
 // provideCredentials creates a per-mount credential directory and provisions credentials into it.
-func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, volumeID string, uid uint32, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
-	mountCredDir, err := dm.ensureCredentialsDirOwnedBy(commDir, volumeID, uid)
+func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir string, uid uint32, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
+	mountCredDir, err := dm.ensureCredentialsDirOwnedBy(commDir, uid)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to create credential directory: %w", err)
 	}
 	credentialCtx.WritePath = mountCredDir
-	credentialCtx.EnvPath = filepath.Join("/comm", volumeID)
+	credentialCtx.EnvPath = filepath.Join("/comm", mountID(uid))
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
 	credentialCtx.Uid = uid
 
@@ -1282,8 +1287,8 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, vol
 }
 
 // cleanupCredentials removes the per-mount credential directory.
-func (dm *DaemonsetMounter) cleanupCredentials(commDir, volumeID string, cleanupCtx credentialprovider.CleanupContext) error {
-	mountCredDir := filepath.Join(commDir, volumeID)
+func (dm *DaemonsetMounter) cleanupCredentials(commDir string, uid uint32, cleanupCtx credentialprovider.CleanupContext) error {
+	mountCredDir := filepath.Join(commDir, mountID(uid))
 	cleanupCtx.WritePath = mountCredDir
 	cleanupCtx.MountKind = credentialprovider.MountKindDaemonset
 	if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
@@ -1512,6 +1517,12 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, err)
 		}
 
+		// Fail closed here too: RemoveMeta finds a meta file by its UID, and a misnamed one may share its UID with another.
+		if metaPath != MetaFileName(dm.kubeletPath, meta.Uid) {
+			return fmt.Errorf("mount meta %s records UID %d, which does not match its name. "+
+				"Drain this node to move workloads elsewhere, then delete this meta file to allow the node to start", metaPath, meta.Uid)
+		}
+
 		if err := dm.uidAllocator.Reserve(meta.Uid); err != nil {
 			klog.Warningf("MountMap: not reserving UID for volume %s: %v", meta.VolumeID, err)
 		}
@@ -1528,6 +1539,7 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 				VolumeID:   meta.VolumeID,
 				SourcePath: sourcePath,
 				CommDir:    meta.CommDir,
+				Uid:        meta.Uid,
 			}
 			cleanupCtx := credentialprovider.CleanupContext{VolumeID: meta.VolumeID}
 			if cleanErr := dm.cleanupMount(entry, cleanupCtx); cleanErr != nil {

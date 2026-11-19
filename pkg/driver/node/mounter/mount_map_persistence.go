@@ -6,16 +6,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"k8s.io/klog/v2"
 	mountutils "k8s.io/mount-utils"
 )
 
-// MetaFileName returns the path to the .meta.json file for a given volume.
+// MetaFileName returns the path to the .meta.json file of the mount whose Mountpoint runs as `uid`.
 // Meta files live in a dedicated directory separate from FUSE source mounts to avoid
 // collisions with PV names that could end in ".meta.json".
-func MetaFileName(kubeletPath, volumeID string) string {
-	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", volumeID+".meta.json")
+func MetaFileName(kubeletPath string, uid uint32) string {
+	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", mountID(uid)+".meta.json")
+}
+
+// mountID identifies the mount whose Mountpoint runs as `uid`, and names its files.
+func mountID(uid uint32) string {
+	// Not the PV name: at up to 253 bytes it leaves no room for a suffix in a 255-byte file name.
+	return "uid-" + strconv.FormatUint(uint64(uid), 10)
 }
 
 // MountMeta is the JSON-serializable structure persisted alongside each source mount.
@@ -55,7 +62,7 @@ func WriteMeta(kubeletPath string, entry *MountEntry) error {
 		return fmt.Errorf("failed to marshal mount meta for volume %s: %w", entry.VolumeID, err)
 	}
 
-	metaPath := MetaFileName(kubeletPath, entry.VolumeID)
+	metaPath := MetaFileName(kubeletPath, entry.Uid)
 	if err := os.MkdirAll(filepath.Dir(metaPath), 0750); err != nil {
 		return fmt.Errorf("failed to create meta directory: %w", err)
 	}
@@ -74,9 +81,9 @@ func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	return nil
 }
 
-// RemoveMeta removes the volume's .meta.json, treating an already-absent file as success.
-func RemoveMeta(kubeletPath, volumeID string) error {
-	return removeMetaFile(MetaFileName(kubeletPath, volumeID))
+// RemoveMeta removes the .meta.json of the mount whose Mountpoint runs as `uid`, treating an already-absent file as success.
+func RemoveMeta(kubeletPath string, uid uint32) error {
+	return removeMetaFile(MetaFileName(kubeletPath, uid))
 }
 
 // removeMetaFile removes the meta file at `metaPath`, treating an already-absent file as success.

@@ -708,8 +708,9 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 
 			// Credential directory should exist while pod is mounted
 			ginkgo.By("Verifying credential directory exists in mounter pod while pod is mounted")
-			listCommDirContents(ctx, f, targetNode, pvName)
-			credDirExists := checkCredentialDirExists(ctx, f, targetNode, pvName)
+			uid := mountUID(ctx, f, targetNode, pvName)
+			listCommDirContents(ctx, f, targetNode, uid)
+			credDirExists := checkCredentialDirExists(ctx, f, targetNode, uid)
 			gomega.Expect(credDirExists).To(gomega.BeTrue(),
 				"expected credential directory for volume %s to exist while pod is mounted", pvName)
 
@@ -755,7 +756,7 @@ func (t *s3CSIPodSharingDaemonsetTestSuite) DefineTests(driver storageframework.
 
 			// Verify credential directory is cleaned up from mounter pod's comm volume
 			ginkgo.By("Verifying credential directory is removed from mounter pod after last consumer unmounts")
-			checkCredentialDirRemoved(ctx, f, targetNode, pvName)
+			checkCredentialDirRemoved(ctx, f, targetNode, uid)
 		})
 
 		ginkgo.It("should recover from mounter pod crash with fresh source mount for new pods", ginkgo.Serial, func(ctx context.Context) {
@@ -1153,6 +1154,12 @@ func isPodReady(pod *v1.Pod) bool {
 	return false
 }
 
+// metaFileOf is a shell word for the path of the .meta.json file of the given volume ID, or "" if there is none.
+// The file is named after the mount's UID, so it is found by the volume ID it records.
+func metaFileOf(volumeID string) string {
+	return fmt.Sprintf(`"$(grep -l -s -F '"volumeID":"%s"' /var/lib/kubelet/plugins/s3.csi.aws.com/meta/*.meta.json)"`, volumeID)
+}
+
 // checkMetaFileExists execs into the CSI node pod and checks if the .meta.json file
 // exists for the given volume ID.
 // Retries on transient exec errors (container restarting, etc.) for up to 1 minute.
@@ -1170,7 +1177,7 @@ func checkMetaFileExists(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("test -f %s && echo EXISTS || echo MISSING", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1257,7 +1264,7 @@ func readMetaFileContent(ctx context.Context, f *framework.Framework, nodeName, 
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("cat %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1320,7 +1327,7 @@ func getMetaFileMtime(ctx context.Context, f *framework.Framework, nodeName, vol
 		}
 
 		csiPod := &pods.Items[0]
-		metaPath := fmt.Sprintf("/var/lib/kubelet/plugins/s3.csi.aws.com/meta/%s.meta.json", volumeID)
+		metaPath := metaFileOf(volumeID)
 		cmd := fmt.Sprintf("stat -c '%%Y' %s 2>/dev/null || echo ''", metaPath)
 
 		stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, csiPod.Name, "s3-plugin", []string{"/bin/sh", "-c", cmd})
@@ -1492,7 +1499,7 @@ func dumpMountpointProcesses(ctx context.Context, f *framework.Framework, nodeNa
 }
 
 // listCommDirContents dumps the contents of /comm/ inside the mounter pod for debugging.
-func listCommDirContents(ctx context.Context, f *framework.Framework, nodeName, volumeID string) {
+func listCommDirContents(ctx context.Context, f *framework.Framework, nodeName string, uid int) {
 	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=s3-csi-daemonset-mounter",
 		FieldSelector: "spec.nodeName=" + nodeName,
@@ -1501,18 +1508,18 @@ func listCommDirContents(ctx context.Context, f *framework.Framework, nodeName, 
 		framework.Logf("DEBUG: Could not find mounter pod for listing: %v", err)
 		return
 	}
-	cmd := fmt.Sprintf("echo '--- /comm/ top-level ---'; ls -la /comm/ 2>&1; echo '--- /comm/%s/ ---'; ls -la /comm/%s/ 2>&1 || true", volumeID, volumeID)
+	cmd := fmt.Sprintf("echo '--- /comm/ top-level ---'; ls -la /comm/ 2>&1; echo '--- /comm/%[1]s/ ---'; ls -la /comm/%[1]s/ 2>&1 || true", mountID(uid))
 	stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, pods.Items[0].Name, "mounter", []string{"/bin/sh", "-c", cmd})
 	if err != nil {
 		framework.Logf("DEBUG: listing /comm/ failed: %v", err)
 		return
 	}
-	framework.Logf("DEBUG /comm/ contents on node %s (looking for %s):\n%s", nodeName, volumeID, stdout)
+	framework.Logf("DEBUG /comm/ contents on node %s (looking for %s):\n%s", nodeName, mountID(uid), stdout)
 }
 
 // queryCredentialDirStatus execs into the mounter pod and returns "EXISTS" or "MISSING" for the credential directory.
 // Returns an error if the exec fails or the mounter pod is not found.
-func queryCredentialDirStatus(ctx context.Context, f *framework.Framework, nodeName, volumeID string) (string, error) {
+func queryCredentialDirStatus(ctx context.Context, f *framework.Framework, nodeName string, uid int) (string, error) {
 	pods, err := f.ClientSet.CoreV1().Pods(csiDriverDaemonSetNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=s3-csi-daemonset-mounter",
 		FieldSelector: "spec.nodeName=" + nodeName,
@@ -1522,7 +1529,7 @@ func queryCredentialDirStatus(ctx context.Context, f *framework.Framework, nodeN
 	}
 
 	mounterPod := &pods.Items[0]
-	credDir := fmt.Sprintf("/comm/%s", volumeID)
+	credDir := fmt.Sprintf("/comm/%s", mountID(uid))
 	cmd := fmt.Sprintf("test -d %s && echo EXISTS || echo MISSING", credDir)
 
 	stdout, _, err := execInPodWithNamespace(ctx, f, csiDriverDaemonSetNamespace, mounterPod.Name, "mounter", []string{"/bin/sh", "-c", cmd})
@@ -1531,15 +1538,15 @@ func queryCredentialDirStatus(ctx context.Context, f *framework.Framework, nodeN
 	}
 
 	output := strings.TrimSpace(stdout)
-	framework.Logf("Credential dir check for %s on node %s: %s", volumeID, nodeName, output)
+	framework.Logf("Credential dir check for %s on node %s: %s", credDir, nodeName, output)
 	return output, nil
 }
 
 // checkCredentialDirExists polls until the credential directory EXISTS in the mounter pod (up to 1 minute).
-func checkCredentialDirExists(ctx context.Context, f *framework.Framework, nodeName, volumeID string) bool {
+func checkCredentialDirExists(ctx context.Context, f *framework.Framework, nodeName string, uid int) bool {
 	var result bool
 	gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
-		status, err := queryCredentialDirStatus(ctx, f, nodeName, volumeID)
+		status, err := queryCredentialDirStatus(ctx, f, nodeName, uid)
 		if err != nil {
 			framework.Logf("Failed to check credential dir (retrying): %v", err)
 			return "", err
@@ -1554,10 +1561,10 @@ func checkCredentialDirExists(ctx context.Context, f *framework.Framework, nodeN
 }
 
 // checkCredentialDirRemoved polls until the credential directory is MISSING from the mounter pod (up to 1 minute).
-func checkCredentialDirRemoved(ctx context.Context, f *framework.Framework, nodeName, volumeID string) bool {
+func checkCredentialDirRemoved(ctx context.Context, f *framework.Framework, nodeName string, uid int) bool {
 	var result bool
 	gomega.Eventually(ctx, func(ctx context.Context) (string, error) {
-		status, err := queryCredentialDirStatus(ctx, f, nodeName, volumeID)
+		status, err := queryCredentialDirStatus(ctx, f, nodeName, uid)
 		if err != nil {
 			framework.Logf("Failed to check credential dir removal (retrying): %v", err)
 			return "", err
