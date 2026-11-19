@@ -618,7 +618,8 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 	errFilePath := filepath.Join(mounter.commDir, GetErrorFileName(volumeID))
 	os.Remove(errFilePath)
 
-	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s) to %s", volumeID, sockPath)
+	mountID := pvFileName(volumeID)
+	klog.V(4).Infof("DaemonsetMounter: sending mount options (mount %s for volume %s) to %s", mountID, volumeID, sockPath)
 
 	sendCtx, sendCancel := context.WithTimeout(ctx, sendOptionsTimeout)
 	defer sendCancel()
@@ -628,7 +629,7 @@ func (dm *DaemonsetMounter) fuseMount(ctx context.Context, bucketName string, mo
 		BucketName: bucketName,
 		Args:       args.SortedList(),
 		Env:        env.List(),
-		VolumeId:   volumeID,
+		VolumeId:   mountID,
 		Uid:        uid,
 		Gid:        uid,
 	})
@@ -877,7 +878,7 @@ func (dm *DaemonsetMounter) forgetMount(volumeID string, entry *MountEntry) {
 
 // GetErrorFileName returns the error file name for a given volume ID.
 func GetErrorFileName(volumeID string) string {
-	return volumeID + MountErrorSuffix
+	return pvFileName(volumeID) + MountErrorSuffix
 }
 
 // cleanupMount removes all resources associated with a mount entry.
@@ -1269,7 +1270,7 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, vol
 		return nil, "", fmt.Errorf("failed to create credential directory: %w", err)
 	}
 	credentialCtx.WritePath = mountCredDir
-	credentialCtx.EnvPath = filepath.Join("/comm", volumeID)
+	credentialCtx.EnvPath = filepath.Join("/comm", pvFileName(volumeID))
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
 	credentialCtx.Uid = uid
 
@@ -1283,7 +1284,7 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, vol
 
 // cleanupCredentials removes the per-mount credential directory.
 func (dm *DaemonsetMounter) cleanupCredentials(commDir, volumeID string, cleanupCtx credentialprovider.CleanupContext) error {
-	mountCredDir := filepath.Join(commDir, volumeID)
+	mountCredDir := filepath.Join(commDir, pvFileName(volumeID))
 	cleanupCtx.WritePath = mountCredDir
 	cleanupCtx.MountKind = credentialprovider.MountKindDaemonset
 	if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
@@ -1510,6 +1511,12 @@ func (dm *DaemonsetMounter) RebuildMountMap() error {
 			// with no recovery path.
 			return fmt.Errorf("failed to read mount meta %s: %w. "+
 				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, err)
+		}
+
+		// A meta file recording another volume, or none, would send that volume's files to the cleanup below.
+		if meta.VolumeID == "" || metaPath != MetaFileName(dm.kubeletPath, meta.VolumeID) {
+			return fmt.Errorf("mount meta %s is not named for the volume it records, %q. "+
+				"Drain this node to move workloads elsewhere, then delete this corrupted meta file to allow the node to start", metaPath, meta.VolumeID)
 		}
 
 		if err := dm.uidAllocator.Reserve(meta.Uid); err != nil {

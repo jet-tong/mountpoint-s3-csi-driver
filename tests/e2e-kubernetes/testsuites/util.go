@@ -536,6 +536,11 @@ func execInMounterPod(ctx context.Context, f *framework.Framework, nodeName, cmd
 	return execInPodOnNode(ctx, f, mounterPodLabel, mounterContainerName, nodeName, cmd)
 }
 
+// pvFileName returns the name s3-csi-node gives the files it keeps for the PV `pvName`.
+func pvFileName(pvName string) string {
+	return fmt.Sprintf("pv-%x", sha256.Sum256([]byte(pvName)))
+}
+
 // createServiceAccountWithAssumableRole creates a service account annotated with a fresh IAM role
 // granting `policyName`, and returns it once the role can be assumed with web identity. The service
 // account and the role are cleaned up when the spec ends.

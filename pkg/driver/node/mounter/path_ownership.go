@@ -83,7 +83,7 @@ func (dm *DaemonsetMounter) secureSharedPaths(commDir string) error {
 // by others, nothing inside is reachable by another Mountpoint whatever mode the files carry.
 // Credentials are therefore written only after this returns.
 func (dm *DaemonsetMounter) ensureCredentialsDirOwnedBy(commDir, volumeID string, uid uint32) (string, error) {
-	dir := filepath.Join(commDir, volumeID)
+	dir := filepath.Join(commDir, pvFileName(volumeID))
 	perm := credentialprovider.IsolatedCredentialDirPerm
 
 	if err := os.Mkdir(dir, perm); err != nil && !errors.Is(err, fs.ErrExist) {
