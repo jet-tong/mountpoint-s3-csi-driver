@@ -10,6 +10,7 @@ import (
 	"helm.sh/helm/v3/pkg/engine"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/yaml"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
@@ -165,4 +166,27 @@ sidecars:
 			}
 		})
 	}
+}
+
+// s3-csi-node gets a PV when it first mounts it on a node, for the UID the mount's files are named after.
+func TestNodeClusterRoleOnlyGetsPersistentVolumes(t *testing.T) {
+	manifests, err := renderChart(t, "", nil)
+	assert.NoError(t, err)
+
+	for _, doc := range strings.Split(manifests[templatePath("serviceaccount-csi-node.yaml")], "\n---") {
+		var role rbacv1.ClusterRole
+		assert.NoError(t, yaml.Unmarshal([]byte(doc), &role))
+		if role.Kind != "ClusterRole" {
+			continue
+		}
+		var verbs []string
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "persistentvolumes") {
+				verbs = append(verbs, rule.Verbs...)
+			}
+		}
+		assert.Equals(t, []string{"get"}, verbs)
+		return
+	}
+	t.Fatal("the chart rendered no ClusterRole for s3-csi-node")
 }

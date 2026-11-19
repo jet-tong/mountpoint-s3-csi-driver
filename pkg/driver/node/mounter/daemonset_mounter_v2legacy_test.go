@@ -97,7 +97,7 @@ func TestIsV3TrackedTarget(t *testing.T) {
 	})
 
 	t.Run("tracked target returns true", func(t *testing.T) {
-		seedEntry(dm, "pv-1", SourceMountPath("/var/lib/kubelet", "pv-1"), "", []string{target})
+		seedEntry(dm, "pv-1", "pv-1-uid", SourceMountPath("/var/lib/kubelet", "pv-1"), "", []string{target})
 		assert.Equals(t, true, dm.isV3TrackedTarget(target))
 	})
 
