@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// sharedDirPerm is the mode for the comm directory, which every mount shares. Only root may
+	// sharedDirPerm is the mode for the comm directory and the mount directories under it. Only root may
 	// create, delete or rename entries, so no Mountpoint can leave a file behind for a later mount.
 	// The execute bit lets a Mountpoint reach its own directory; withholding read stops it listing
 	// the parent to discover other mounts.
@@ -76,20 +76,58 @@ func (dm *DaemonsetMounter) secureSharedPaths(commDir string) error {
 	return nil
 }
 
-// ensureCredentialsDirOwnedBy creates this mount's credential directory, hands it to `uid`, closes it
-// to every other UID, and returns its path.
+// ensureCredentialsDirOwnedBy creates this mount's directory and credential directory, hands the credential
+// directory to `uid`, closes it to every other UID, and returns its path.
 //
 // It is the gate that isolates the mount: once the directory is owned by `uid` and not traversable
 // by others, nothing inside is reachable by another Mountpoint whatever mode the files carry.
 // Credentials are therefore written only after this returns.
 func (dm *DaemonsetMounter) ensureCredentialsDirOwnedBy(commDir, volumeID string, uid uint32) (string, error) {
-	dir := filepath.Join(commDir, volumeID)
+	// Created through a root on the comm directory, which the mounter can write, so a link planted there cannot lead outside it.
+	root, err := os.OpenRoot(commDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open comm dir %q: %w", commDir, err)
+	}
+	defer root.Close()
+
+	// Under its own directory, so no PV name can meet a fixed name in the comm directory, such as the socket.
+	mountDir := filepath.Join(MountsDirName, volumeID)
+	if err := root.MkdirAll(mountDir, sharedDirPerm); err != nil {
+		return "", fmt.Errorf("failed to create directory %q: %w", filepath.Join(commDir, mountDir), err)
+	}
+	// Root-owned, so a Mountpoint can reach its credentials but create nothing beside them, such as its error file.
+	for _, d := range []string{MountsDirName, mountDir} {
+		if err := dm.ownIn(root, d, 0, 0, sharedDirPerm); err != nil {
+			return "", err
+		}
+	}
+	credDir := filepath.Join(mountDir, "credentials")
 	perm := credentialprovider.IsolatedCredentialDirPerm
 
-	if err := os.Mkdir(dir, perm); err != nil && !errors.Is(err, fs.ErrExist) {
-		return "", fmt.Errorf("failed to create directory %q: %w", dir, err)
+	if err := root.Mkdir(credDir, perm); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", fmt.Errorf("failed to create directory %q: %w", filepath.Join(commDir, credDir), err)
 	}
-	return dir, dm.own(dir, int(uid), int(uid), perm)
+	return filepath.Join(commDir, credDir), dm.ownIn(root, credDir, int(uid), int(uid), perm)
+}
+
+// ownIn sets the owner and mode of `name`, resolved inside `root`, so a link on the way cannot lead outside it.
+func (dm *DaemonsetMounter) ownIn(root *os.Root, name string, uid, gid int, perm fs.FileMode) error {
+	path := filepath.Join(root.Name(), name)
+	chown := func() error { return root.Lchown(name, uid, gid) }
+	if dm.chown != nil {
+		chown = func() error { return dm.chown(path, uid, gid) }
+	}
+	chmod := func() error { return root.Chmod(name, perm) }
+	if dm.chmod != nil {
+		chmod = func() error { return dm.chmod(path, perm) }
+	}
+	if err := chown(); err != nil {
+		return fmt.Errorf("failed to chown %q to %d:%d: %w", path, uid, gid, err)
+	}
+	if err := chmod(); err != nil {
+		return fmt.Errorf("failed to chmod %q to %o: %w", path, perm, err)
+	}
+	return nil
 }
 
 // own sets `path`'s owner and mode.

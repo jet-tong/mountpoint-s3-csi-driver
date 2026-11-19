@@ -15,15 +15,15 @@
 //  2. The mounter receives the options, spawns a Mountpoint child process with the FUSE fd,
 //     and closes the connection.
 //  3. If the mounter refuses a request with a valid mount-id, or the Mountpoint process exits with a non-zero
-//     code, the reason or its stderr is written to <comm-dir>/<mount-id>.error. Nothing is written on clean (zero) exit.
+//     code, the reason or its stderr is written to <comm-dir>/mounts/<mount-id>/error. Nothing is written on clean (zero) exit.
 //     The driver is responsible for removing this file during Unmount.
 //
-// The mount-id (Options.VolumeId) must be unique per active mount (e.g. <WorkloadPodId>-<VolumeId>
-// or just <VolumeId> with pod sharing). Duplicate mount-ids are rejected, and so is a UID a running Mountpoint holds.
+// The mount-id (Options.VolumeId) must be unique per active mount; s3-csi-node sends the PV name, as it shares one
+// mount per PV. Duplicate mount-ids are rejected, and so is a UID a running Mountpoint holds.
 //
 // Note: if Mountpoint crashes with non-zero exit after the driver has already completed Unmount,
-// a small .error file may be left behind. This is bounded by the number of such rare race
-// occurrences and each file is only a few KB of stderr.
+// the driver has removed the mount's directory, so no error file is left behind: the mounter only
+// logs that it could not write one.
 package main
 
 import (

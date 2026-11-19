@@ -182,7 +182,7 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 		dm := mounter.NewDaemonsetMounter(clientset, nodeID, mpmounter.New(), credProvider, nil, nil, nil, kubernetesVersion, variant)
 		dm.SetFallbackVolumeLimit(fallbackVolumeLimit)
 
-		// Rebuild mount map from persisted .meta.json files + kernel mount table.
+		// Rebuild mount map from persisted meta.json files + kernel mount table.
 		// Fatal on failure: operating with an empty map while FUSE mounts exist
 		// would cause duplicate mounts or incorrect unmounts.
 		if err := dm.RebuildMountMap(); err != nil {

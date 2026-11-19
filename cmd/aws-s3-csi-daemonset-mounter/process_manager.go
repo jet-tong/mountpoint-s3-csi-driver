@@ -24,7 +24,7 @@ import (
 )
 
 const errorFilePerm = fs.FileMode(0600)
-const errorFileExt = ".error"
+const mountsDirName = "mounts"
 
 // cacheVolumePerm lets a Mountpoint reach its own cache directory but not create or list entries beside it.
 const cacheVolumePerm = fs.FileMode(0711)
@@ -220,7 +220,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	// Delete any error files that earlier Mountpoint of this PV wrote after node deletes error files.
 	// TODO if we add process to ensure Mountpoint exited, this should not be needed.
-	os.Remove(filepath.Join(pm.commDir, mountId+errorFileExt))
+	os.Remove(filepath.Join(pm.commDir, mountsDirName, mountId, "error"))
 
 	// No leftover check here: every cache directory left behind (by an exited Mountpoint, a failed start, or the startup cleanup)
 	// keeps its UID marked cleanupPending, refused above, until the cache cleaner removes it.
@@ -466,7 +466,7 @@ func (pm *ProcessManager) chownWithDefault(path string, uid, gid int) error {
 // writeErrorFile reports a mount failure to the driver, whose waitForMount polls for this file — the
 // only reply channel on the otherwise one-way mount socket.
 func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
-	errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+	errPath := filepath.Join(pm.commDir, mountsDirName, mountId, "error")
 	// TODO(vlaad): write error file atomically (open,write,rename)
 	if err := os.WriteFile(errPath, content, errorFilePerm); err != nil {
 		klog.Errorf("Failed to write error file for mount %s: %v", mountId, err)

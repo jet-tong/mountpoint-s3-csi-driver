@@ -11,11 +11,11 @@ import (
 	mountutils "k8s.io/mount-utils"
 )
 
-// MetaFileName returns the path to the .meta.json file for a given volume.
-// Meta files live in a dedicated directory separate from FUSE source mounts to avoid
-// collisions with PV names that could end in ".meta.json".
+// MetaFileName returns the path to the meta.json file for a given volume.
+// Meta files live in a dedicated directory separate from FUSE source mounts, one directory per PV, as
+// a 253-byte PV name leaves no room for a suffix in a 255-byte file name.
 func MetaFileName(kubeletPath, volumeID string) string {
-	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", volumeID+".meta.json")
+	return filepath.Join(kubeletPath, "plugins", "s3.csi.aws.com", "meta", volumeID, "meta.json")
 }
 
 // MountMeta is the JSON-serializable structure persisted alongside each source mount.
@@ -34,7 +34,7 @@ type MountMeta struct {
 	Uid                      uint32   `json:"uid"`
 }
 
-// WriteMeta atomically writes the .meta.json file for the given volume.
+// WriteMeta atomically writes the meta.json file for the given volume.
 // Uses temp file + os.Rename for atomicity (rename is atomic on Linux).
 func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	meta := MountMeta{
@@ -74,7 +74,7 @@ func WriteMeta(kubeletPath string, entry *MountEntry) error {
 	return nil
 }
 
-// RemoveMeta removes the volume's .meta.json, treating an already-absent file as success.
+// RemoveMeta removes the volume's meta.json and its directory, treating an already-absent file as success.
 func RemoveMeta(kubeletPath, volumeID string) error {
 	return removeMetaFile(MetaFileName(kubeletPath, volumeID))
 }
@@ -84,10 +84,12 @@ func removeMetaFile(metaPath string) error {
 	if err := os.Remove(metaPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove meta file %s: %w", metaPath, err)
 	}
+	// Best effort: a directory left without meta.json, e.g. by a WriteMeta cut short, is skipped at startup.
+	os.Remove(filepath.Dir(metaPath))
 	return nil
 }
 
-// readMeta reads and parses a .meta.json file.
+// readMeta reads and parses a meta.json file.
 func readMeta(path string) (*MountMeta, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

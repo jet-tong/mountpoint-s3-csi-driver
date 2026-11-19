@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
@@ -180,6 +181,21 @@ func TestRemoveMeta_NoopIfNotExists(t *testing.T) {
 	assert.NoError(t, RemoveMeta(kubeletPath, "vol-nonexistent"))
 }
 
+func TestWriteAndRemoveMeta_253BytePVName(t *testing.T) {
+	kubeletPath := t.TempDir()
+	// The longest PV name Kubernetes allows, which leaves no room for a suffix in a 255-byte file name.
+	volumeID := "pv-" + strings.Repeat("a", 250)
+
+	assert.NoError(t, WriteMeta(kubeletPath, &MountEntry{VolumeID: volumeID, SourcePath: "/source"}))
+	meta, err := readMeta(MetaFileName(kubeletPath, volumeID))
+	assert.NoError(t, err)
+	assert.Equals(t, volumeID, meta.VolumeID)
+
+	assert.NoError(t, RemoveMeta(kubeletPath, volumeID))
+	// The volume's directory goes too, or the node would keep one for every PV it ever mounted.
+	assert.FileNotExists(t, filepath.Dir(MetaFileName(kubeletPath, volumeID)))
+}
+
 func TestReadMeta_ParsesCorrectly(t *testing.T) {
 	kubeletPath := t.TempDir()
 
@@ -236,7 +252,7 @@ func TestReadMeta_FileNotFound(t *testing.T) {
 
 func TestMetaFileName_Format(t *testing.T) {
 	path := MetaFileName("/var/lib/kubelet", "vol-test-123")
-	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/vol-test-123.meta.json"
+	expected := "/var/lib/kubelet/plugins/s3.csi.aws.com/meta/vol-test-123/meta.json"
 	assert.Equals(t, expected, path)
 }
 
@@ -365,7 +381,7 @@ func TestRebuildMountMap_SkipsNonMetaFiles(t *testing.T) {
 	err := os.MkdirAll(metaDir, 0750)
 	assert.NoError(t, err)
 
-	// Create non-meta files
+	// Create entries that are not meta files: a volume directory without meta.json, and a stray file
 	os.Mkdir(filepath.Join(metaDir, "vol-123"), 0750)
 	os.WriteFile(filepath.Join(metaDir, "something.txt"), []byte("hello"), 0640)
 
@@ -385,7 +401,8 @@ func TestRebuildMountMap_FailsOnInvalidMetaJSON(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Invalid meta file
-	metaPath := filepath.Join(metaDir, "vol-bad.meta.json")
+	metaPath := MetaFileName(kubeletPath, "vol-bad")
+	assert.NoError(t, os.MkdirAll(filepath.Dir(metaPath), 0750))
 	os.WriteFile(metaPath, []byte("not-json"), 0640)
 
 	dm := newTestDMWithMountInfo(kubeletPath, fakeMountInfoProvider(nil))
@@ -399,6 +416,26 @@ func TestRebuildMountMap_FailsOnInvalidMetaJSON(t *testing.T) {
 
 	if dm.mountMap.Get("vol-bad") != nil {
 		t.Fatal("should not create entry for invalid meta")
+	}
+}
+
+func TestRebuildMountMap_FailsOnMetaNamingAnotherVolume(t *testing.T) {
+	for _, meta := range []string{
+		`{"volumeID":"vol-b","volumeHandle":"handle-a"}`,
+		// Names no volume: its cleanup would otherwise take every mount's directory in the comm dir.
+		`{"volumeHandle":"handle-a"}`,
+	} {
+		kubeletPath := t.TempDir()
+		metaPath := MetaFileName(kubeletPath, "vol-a")
+		assert.NoError(t, os.MkdirAll(filepath.Dir(metaPath), 0750))
+		assert.NoError(t, os.WriteFile(metaPath, []byte(meta), 0600))
+
+		dm := newTestDMWithMountInfo(kubeletPath, fakeMountInfoProvider(nil))
+		err := dm.RebuildMountMap()
+		if err == nil {
+			t.Fatalf("expected RebuildMountMap to fail on meta %s in vol-a's directory, got nil", meta)
+		}
+		assert.Contains(t, err.Error(), metaPath)
 	}
 }
 
@@ -783,7 +820,7 @@ func TestForgetMount_KeepsEntryWhenMetaRemovalFails(t *testing.T) {
 	entry.Params.VolumeHandle = "handle-1"
 	assert.NoError(t, dm.mountMap.ClaimHandle("handle-1", volumeID))
 
-	// Make RemoveMeta fail: a non-empty directory where the .meta.json would be.
+	// Make RemoveMeta fail: a non-empty directory where meta.json would be.
 	metaPath := MetaFileName(kubeletPath, volumeID)
 	assert.NoError(t, os.MkdirAll(filepath.Join(metaPath, "blocker"), 0750))
 
@@ -804,13 +841,13 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 
 	// Create a comm dir with credential files that should be cleaned up
 	commDir := filepath.Join(kubeletPath, "pods", "mounter-uid", "volumes", "kubernetes.io~empty-dir", "comm")
-	credDir := filepath.Join(commDir, "vol-dead-creds")
+	credDir := filepath.Join(commDir, "mounts", "vol-dead-creds", "credentials")
 	err := os.MkdirAll(credDir, 0750)
 	assert.NoError(t, err)
 	// Simulate a token file in the cred dir
 	os.WriteFile(filepath.Join(credDir, "token.jwt"), []byte("secret"), 0600)
 	// Simulate an error file
-	os.WriteFile(filepath.Join(commDir, "vol-dead-creds.error"), []byte("mount failed"), 0600)
+	assert.NoError(t, os.WriteFile(filepath.Join(commDir, "mounts", "vol-dead-creds", "error"), []byte("mount failed"), 0600))
 
 	entry := &MountEntry{
 		VolumeID:   "vol-dead-creds",
@@ -833,7 +870,7 @@ func TestRebuildMountMap_DeadSourceCleansCredentials(t *testing.T) {
 	}
 
 	// Error file should be cleaned up
-	_, err = os.Stat(filepath.Join(commDir, "vol-dead-creds.error"))
+	_, err = os.Stat(filepath.Join(commDir, "mounts", "vol-dead-creds", "error"))
 	if !os.IsNotExist(err) {
 		t.Fatal("expected error file to be removed for dead source")
 	}
@@ -894,8 +931,8 @@ func TestCleanupOrphans(t *testing.T) {
 			name: "dead source torn down, with its credentials and error file",
 			setup: func(t *testing.T, dm *DaemonsetMounter, _ *mountutils.FakeMounter, kubeletPath, sourcePath, _ string) {
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, volumeID), 0750))
-				os.WriteFile(filepath.Join(commDir, volumeID+".error"), []byte("boom"), 0600)
+				assert.NoError(t, os.MkdirAll(filepath.Join(commDir, "mounts", volumeID, "credentials"), 0750))
+				assert.NoError(t, os.WriteFile(filepath.Join(commDir, "mounts", volumeID, "error"), []byte("boom"), 0600))
 				entry := seedEntry(dm, volumeID, sourcePath, commDir, nil)
 				assert.NoError(t, WriteMeta(kubeletPath, entry))
 			},
@@ -1034,8 +1071,8 @@ func TestCleanupOrphans(t *testing.T) {
 			if tt.expectCommGone {
 				// An orphan's credentials and error file must not outlive it.
 				commDir := filepath.Join(kubeletPath, "comm")
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID))))
-				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, volumeID+".error"))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, "mounts", volumeID))))
+				assert.Equals(t, true, os.IsNotExist(statErr(filepath.Join(commDir, "mounts", volumeID, "error"))))
 			}
 		})
 	}
